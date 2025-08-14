@@ -29,15 +29,17 @@ resource "aws_subnet" "public_subnets" {
   count = length(var.public_subnets["cidrs_blocks"])
   vpc_id            = aws_vpc.vpc.id
   cidr_block        = element(var.public_subnets["cidrs_blocks"], count.index)
+  availability_zone = var.availability_zones[count.index]
   map_public_ip_on_launch = true
-  tags = merge(var.common_tags, { Name = "Public Subnet ${count.index + 1}" })
+  tags = merge(var.common_tags, { Name = "${var.environment} Public Subnet ${count.index + 1}", AvailabilityZone = var.availability_zones[count.index] } )
 }
 
 resource "aws_subnet" "private_subnets" {
   count = length(var.private_subnets["cidrs_blocks"])
   vpc_id     = aws_vpc.vpc.id
   cidr_block = element(var.private_subnets["cidrs_blocks"], count.index)
-  tags = merge(var.common_tags, { Name = "Private Subnet ${count.index + 1}" })
+  availability_zone = var.availability_zones[count.index]
+  tags = merge(var.common_tags, { Name = "${var.environment} Private Subnet ${count.index + 1}", AvailabilityZone = var.availability_zones[count.index] })
 }
 
 
@@ -46,7 +48,7 @@ resource "aws_subnet" "private_subnets" {
 # Public Route Table (Routes traffic to the Internet Gateway)
 resource "aws_route_table" "public_rt" {
   vpc_id = aws_vpc.vpc.id
-  tags   = merge(var.common_tags, { Name = "Public Route Table" })
+  tags   = merge(var.common_tags, { Name = "${var.environment} Public Route Table" })
 }
 
 resource "aws_route" "public_route" {
@@ -58,7 +60,7 @@ resource "aws_route" "public_route" {
 # Private Route Table (Routes traffic via NAT Gateway)
 resource "aws_route_table" "private_rt" {
   vpc_id = aws_vpc.vpc.id
-  tags   = merge(var.common_tags, { Name = "Private Route Table" })
+  tags   = merge(var.common_tags, { Name = "${var.environment} Private Route Table" })
 }
 
 resource "aws_route" "private_route" {
