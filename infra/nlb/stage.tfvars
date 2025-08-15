@@ -1,4 +1,4 @@
-tf_state_bucket    = "stage-btl-idlms-backend-api-tfstate"
+tf_state_bucket    = "stage-btl-idlms-backend-api-tfstate-592776312448"
 environment        = "stage"
 region             = "ap-southeast-1"
 tf_state_region    = "ap-southeast-1"
