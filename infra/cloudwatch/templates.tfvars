@@ -1,6 +1,6 @@
 # --- Environment ---
 environment =         # e.g., "stage"
-region      =         # AWS region (e.g., "eu-west-1")
+region      =         # AWS region (e.g., "ap-southeast-1")
 
 # --- CloudWatch Logging ---
 docker_log_group_name =         # Name of the CloudWatch Log Group (e.g., "/stage/docker/api")
@@ -12,4 +12,4 @@ ssm_tag_name   =                # Tag used to identify the config (e.g., "stage-
 
 # --- Terraform Remote State ---
 tf_state_bucket =         # Name of the S3 bucket holding Terraform state
-tf_state_region =         # AWS region where the state bucket is located (e.g., "eu-west-1")
+tf_state_region =         # AWS region where the state bucket is located (e.g., "ap-southeast-1")

@@ -191,8 +191,8 @@
 				"ssm:SendCommand",
 				"ssm:GetParameters",
 				"ssm:AddTagsToResource",
-                                "ssm:GetCommandInvocation",
-                                "ssm:ListCommandInvocations"
+				"ssm:GetCommandInvocation",
+				"ssm:ListCommandInvocations"
 			],
 			"Resource": "*"
 		},
