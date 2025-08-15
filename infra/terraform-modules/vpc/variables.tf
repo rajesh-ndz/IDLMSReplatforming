@@ -62,10 +62,10 @@ variable "nat_gateway_name" {
 ###Private App Subnets###
 variable "private_subnets" {
   type = object({
-    routes                   = list(any)
-    cidrs_blocks             = list(string)
-    subnets_name_prefix      = string
-    route_table_name         = string
+    routes              = list(any)
+    cidrs_blocks        = list(string)
+    subnets_name_prefix = string
+    route_table_name    = string
   })
 }
 
@@ -73,17 +73,17 @@ variable "private_subnets" {
 ###Public Subnets###
 variable "public_subnets" {
   type = object({
-    routes                   = list(any)
-    cidrs_blocks             = list(string)
-    subnets_name_prefix      = string
-    map_public_ip_on_launch  = bool
-    route_table_name         = string
+    routes                  = list(any)
+    cidrs_blocks            = list(string)
+    subnets_name_prefix     = string
+    map_public_ip_on_launch = bool
+    route_table_name        = string
   })
 }
 
 ### Availability Zones ###
 variable "availability_zones" {
   type    = list(string)
-  default = ["eu-west-1a", "eu-west-1b"]  # Or use data source for dynamic values
+  default = ["ap-southeast-1a", "ap-southeast-1b"] # Or use data source for dynamic values
 }
 
