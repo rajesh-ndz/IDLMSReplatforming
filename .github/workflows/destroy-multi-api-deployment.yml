@@ -6,7 +6,7 @@ on:
       ENV:
         description: 'Environment to destroy (dev/staging/prod)'
         required: true
-        default: 'dev'
+        default: 'stage'
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
