@@ -12,7 +12,7 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   TF_REGION:  ${{ vars.AWS_REGION }}
   # MUST match deploy bucket naming (includes account id)
-  TF_BUCKET:  ${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-${{ secrets.AWS_ACCOUNT_ID }}
+  TF_BUCKET:  ${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate
 
 jobs:
   destroy:
