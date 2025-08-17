@@ -15,7 +15,6 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   TF_BUCKET: ${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-${{ secrets.AWS_ACCOUNT_ID }}
   TF_REGION: ${{ vars.AWS_REGION }}
- 
 
 jobs:
   deploy:
@@ -24,6 +23,9 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout feature/btl-77 codebase
@@ -47,25 +49,17 @@ jobs:
         id: aws-account
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT" 
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
 
       - name: Set dynamic backup bucket name
-        run: echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV              
+        run: echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
 
-      # - name: Terraform Apply VPC
-      #   if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
-      #   run: |
-      #     cd infra/vpc
-      #     terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" -backend-config="region=${TF_REGION}"
-      #     terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-
-      # 0) Quick sanity: show account IDs (backend naming vs STS)
       - name: Sanity check IDs
         run: |
           echo "TF_BUCKET uses secrets.AWS_ACCOUNT_ID = ${{ secrets.AWS_ACCOUNT_ID }}"
           echo "STS says account_id                 = ${{ steps.aws-account.outputs.account_id }}"
-              
-      # 1) Init VPC
+
+      # ========= VPC =========
       - name: Terraform Init VPC
         working-directory: infra/vpc
         run: |
@@ -74,112 +68,101 @@ jobs:
             -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" \
             -backend-config="region=${TF_REGION}" \
             -reconfigure -input=false
-              
-      # 2) Adopt existing IAM (imports if missing)
+
       - name: Adopt IAM (import if missing)
         working-directory: infra/vpc
         env:
           ENV_NAME: ${{ github.event.inputs.ENV }}
           ACCOUNT_ID: ${{ steps.aws-account.outputs.account_id }}
-        shell: bash
         run: |
           set -euo pipefail
           set -x
-        
+
+          TFVARS_FILE="${ENV_NAME}.tfvars"
           ROLE="ec2_ssm_role-${ENV_NAME}"
           PROFILE="${ENV_NAME}-ec2_ssm_profile"
-        
+
+          in_state() {
+            local addr="$1"
+            terraform state list | grep -qx "$addr"
+          }
+
           try_import() {
             local addr="$1" id="$2"
-            if ! terraform state show "$addr" >/dev/null 2>&1; then
+            if ! in_state "$addr"; then
               echo "Importing $addr -> $id"
-              terraform import -input=false "$addr" "$id" || true
+              # IMPORTANT: pass var-file so required variables are satisfied during import
+              terraform import -input=false -var-file="$TFVARS_FILE" "$addr" "$id" || true
             else
               echo "Already in state: $addr"
             fi
           }
-        
+
           # Role & Instance Profile
           try_import aws_iam_role.ec2_ssm_role                "$ROLE"
           try_import aws_iam_instance_profile.ec2_ssm_profile "$PROFILE"
-        
-          # Policies (build ARNs directly)
-          for NAME ADDR in \
-            "${ENV_NAME}-ec2-s3-docker-backup-access" aws_iam_policy.s3_docker_backup_access \
-            "${ENV_NAME}-ec2-ecr-pull-access"         aws_iam_policy.ecr_pull \
-            "${ENV_NAME}-ec2-elb-describe-access"     aws_iam_policy.elb_describe \
-            "${ENV_NAME}-ec2-ssm-describe-instance"   aws_iam_policy.ssm_debug \
-            "${ENV_NAME}-ec2-describe-instances"      aws_iam_policy.ec2_describe \
-            "${ENV_NAME}-ec2-ssm-get-parameter"       aws_iam_policy.ssm_get_parameter
-          do
+
+          # Policies (deterministic ARNs)
+          while read -r NAME ADDR; do
             ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${NAME}"
             try_import "$ADDR" "$ARN"
-          done
-        
+          done <<'LIST'
+          '"'"${ENV_NAME}"'"'-ec2-s3-docker-backup-access aws_iam_policy.s3_docker_backup_access
+          '"'"${ENV_NAME}"'"'-ec2-ecr-pull-access         aws_iam_policy.ecr_pull
+          '"'"${ENV_NAME}"'"'-ec2-elb-describe-access     aws_iam_policy.elb_describe
+          '"'"${ENV_NAME}"'"'-ec2-ssm-describe-instance   aws_iam_policy.ssm_debug
+          '"'"${ENV_NAME}"'"'-ec2-describe-instances      aws_iam_policy.ec2_describe
+          '"'"${ENV_NAME}"'"'-ec2-ssm-get-parameter       aws_iam_policy.ssm_get_parameter
+          LIST
+
           echo "----- State after adoption (first 100) -----"
           terraform state list | sed -n '1,100p'
-        
-      # 3) Confirm IAM is in state (NOW this check is useful)
-      - name: Debug IAM state (post-adopt)
-        working-directory: infra/vpc
-        run: |
-          terraform state show aws_iam_role.ec2_ssm_role || true
-          terraform state show aws_iam_instance_profile.ec2_ssm_profile || true
-          terraform state show aws_iam_policy.s3_docker_backup_access || true
-          terraform state show aws_iam_policy.ecr_pull || true
-          terraform state show aws_iam_policy.elb_describe || true
-          terraform state show aws_iam_policy.ssm_debug || true
-          terraform state show aws_iam_policy.ec2_describe || true
-          terraform state show aws_iam_policy.ssm_get_parameter || true
-        
-      # 4) Apply VPC
+
       - name: Terraform Apply VPC
         working-directory: infra/vpc
         run: terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
 
-
+      # ========= NLB =========
       - name: Terraform Apply NLB
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
+        working-directory: infra/nlb
         run: |
-          cd infra/nlb
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/nlb/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
 
+      # ========= API Gateway =========
       - name: Terraform Apply API Gateway
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
+        working-directory: infra/rest-api
         run: |
-          cd infra/rest-api
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/rest-api/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform refresh -var-file="${{ github.event.inputs.ENV }}.tfvars"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
 
+      # ========= CloudWatch =========
       - name: Terraform Apply CloudWatch
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
+        working-directory: infra/cloudwatch
         run: |
-          cd infra/cloudwatch
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/cloudwatch/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
 
+      # ========= ECR =========
       - name: Terraform Apply ECR
         id: ecr
+        working-directory: infra/ecr
         run: |
-          cd infra/ecr
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/ecr/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-          RAW_OUTPUT=$(terraform output -raw ecr_repository_url 2>&1)
-          ECR_REPO_URL=$(${TERRAFORM_CLI_PATH}/terraform-bin output -raw ecr_repository_url)
-          echo "Raw Terraform Output: [$RAW_OUTPUT]"
-
-          #ECR_REPO_URL=$(terraform output -raw ecr_repository_url | xargs)
-          #ECR_REPO_URL1=$(terraform output -raw ecr_repository_url | xargs)
+          ECR_REPO_URL="$(terraform output -raw ecr_repository_url | tr -d '\r\n')"
           echo "ECR_REPO_URL=$ECR_REPO_URL" >> $GITHUB_ENV
-          echo $ECR_REPO_URL
-          echo $GITHUB_ENV
+          echo "Using ECR: $ECR_REPO_URL"
 
+      # ========= SSM =========
       - name: Terraform Apply SSM
         id: ssm
+        working-directory: infra/ssm
         run: |
-          cd infra/ssm
           PARAM_NAME="/idlms/shared/${{ github.event.inputs.ENV }}/.env"
           if aws ssm get-parameter --name "$PARAM_NAME" --with-decryption > /dev/null 2>&1; then
             ENV_CONTENT=$(aws ssm get-parameter --name "$PARAM_NAME" --with-decryption --query "Parameter.Value" --output text)
@@ -194,23 +177,23 @@ jobs:
           SSM_ENV_PARAM=$(terraform output -raw ssm_env_param_name | tr -d '\r\n' | sed 's/^ssm:\/\///')
           echo "SSM_ENV_PARAM=$SSM_ENV_PARAM" >> $GITHUB_ENV
 
+      # ========= S3 (artifact) =========
       - name: Terraform Apply S3
         id: s3_apply
+        working-directory: infra/s3
         run: |
-          cd infra/s3
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/s3/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-      
-  
+
       - name: Upload docker-compose.yml to S3
         run: |
           echo "Uploading to bucket: $BACKUP_BUCKET"
-          aws s3 cp docker/docker-compose.yml s3://$BACKUP_BUCKET/${{ github.event.inputs.ENV }}/docker-compose.yml   
-      
-          
+          aws s3 cp docker/docker-compose.yml "s3://$BACKUP_BUCKET/${{ github.event.inputs.ENV }}/docker-compose.yml"
+
+      # ========= Docker build & push =========
       - name: Print ECR URL
         run: echo "Using ECR:$ECR_REPO_URL"
-        
+
       - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -230,12 +213,12 @@ jobs:
           echo "BUILD_TAG=$BUILD_TAG" >> $GITHUB_ENV
 
       - name: Build and tag Docker image
-        run: docker build -t $IMAGE_URI -t $LATEST_URI -f docker/Dockerfile src
+        run: docker build -t "$IMAGE_URI" -t "$LATEST_URI" -f docker/Dockerfile src
 
       - name: Push Docker images to ECR
         run: |
-          docker push $IMAGE_URI
-          docker push $LATEST_URI
+          docker push "$IMAGE_URI"
+          docker push "$LATEST_URI"
 
       - name: Determine tag to deploy
         id: determine-tag
