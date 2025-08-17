@@ -52,12 +52,91 @@ jobs:
       - name: Set dynamic backup bucket name
         run: echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV              
 
-      - name: Terraform Apply VPC
-        if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
+      # - name: Terraform Apply VPC
+      #   if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
+      #   run: |
+      #     cd infra/vpc
+      #     terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" -backend-config="region=${TF_REGION}"
+      #     terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+
+      # 0) Quick sanity: show account IDs (backend naming vs STS)
+      - name: Sanity check IDs
         run: |
-          cd infra/vpc
-          terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" -backend-config="region=${TF_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          echo "TF_BUCKET uses secrets.AWS_ACCOUNT_ID = ${{ secrets.AWS_ACCOUNT_ID }}"
+          echo "STS says account_id                 = ${{ steps.aws-account.outputs.account_id }}"
+              
+      # 1) Init VPC
+      - name: Terraform Init VPC
+        working-directory: infra/vpc
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_BUCKET}" \
+            -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" \
+            -backend-config="region=${TF_REGION}" \
+            -reconfigure -input=false
+              
+      # 2) Adopt existing IAM (imports if missing)
+      - name: Adopt IAM (import if missing)
+        working-directory: infra/vpc
+        env:
+          ENV_NAME: ${{ github.event.inputs.ENV }}
+          ACCOUNT_ID: ${{ steps.aws-account.outputs.account_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -x
+        
+          ROLE="ec2_ssm_role-${ENV_NAME}"
+          PROFILE="${ENV_NAME}-ec2_ssm_profile"
+        
+          try_import() {
+            local addr="$1" id="$2"
+            if ! terraform state show "$addr" >/dev/null 2>&1; then
+              echo "Importing $addr -> $id"
+              terraform import -input=false "$addr" "$id" || true
+            else
+              echo "Already in state: $addr"
+            fi
+          }
+        
+          # Role & Instance Profile
+          try_import aws_iam_role.ec2_ssm_role                "$ROLE"
+          try_import aws_iam_instance_profile.ec2_ssm_profile "$PROFILE"
+        
+          # Policies (build ARNs directly)
+          for NAME ADDR in \
+            "${ENV_NAME}-ec2-s3-docker-backup-access" aws_iam_policy.s3_docker_backup_access \
+            "${ENV_NAME}-ec2-ecr-pull-access"         aws_iam_policy.ecr_pull \
+            "${ENV_NAME}-ec2-elb-describe-access"     aws_iam_policy.elb_describe \
+            "${ENV_NAME}-ec2-ssm-describe-instance"   aws_iam_policy.ssm_debug \
+            "${ENV_NAME}-ec2-describe-instances"      aws_iam_policy.ec2_describe \
+            "${ENV_NAME}-ec2-ssm-get-parameter"       aws_iam_policy.ssm_get_parameter
+          do
+            ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${NAME}"
+            try_import "$ADDR" "$ARN"
+          done
+        
+          echo "----- State after adoption (first 100) -----"
+          terraform state list | sed -n '1,100p'
+        
+      # 3) Confirm IAM is in state (NOW this check is useful)
+      - name: Debug IAM state (post-adopt)
+        working-directory: infra/vpc
+        run: |
+          terraform state show aws_iam_role.ec2_ssm_role || true
+          terraform state show aws_iam_instance_profile.ec2_ssm_profile || true
+          terraform state show aws_iam_policy.s3_docker_backup_access || true
+          terraform state show aws_iam_policy.ecr_pull || true
+          terraform state show aws_iam_policy.elb_describe || true
+          terraform state show aws_iam_policy.ssm_debug || true
+          terraform state show aws_iam_policy.ec2_describe || true
+          terraform state show aws_iam_policy.ssm_get_parameter || true
+        
+      # 4) Apply VPC
+      - name: Terraform Apply VPC
+        working-directory: infra/vpc
+        run: terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+
 
       - name: Terraform Apply NLB
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
