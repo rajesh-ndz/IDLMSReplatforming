@@ -54,10 +54,49 @@ resource "aws_iam_policy" "s3_docker_backup_access" {
   })
 }
 
+# resource "aws_iam_role_policy_attachment" "s3_docker_backup_access" {
+# role       = aws_iam_role.ec2_ssm_role.name
+# policy_arn = aws_iam_policy.s3_docker_backup_access.arn
+# }
+
+# Get account id once
+data "aws_caller_identity" "current" {}
+
+# Build the bucket name your EC2 must read from: idlms-<env>-built-artifact-<account>
+locals {
+  docker_backup_bucket = "idlms-${var.environment}-built-artifact-${data.aws_caller_identity.current.account_id}"
+}
+
+# S3 policy: allow listing the bucket and reading objects under "<env>/"
+resource "aws_iam_policy" "s3_docker_backup_access" {
+  name = "${var.environment}-ec2-s3-docker-backup-access"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid      = "ListAndLocateBucket",
+        Effect   = "Allow",
+        Action   = ["s3:ListBucket", "s3:GetBucketLocation"],
+        Resource = "arn:aws:s3:::${local.docker_backup_bucket}"
+      },
+      {
+        Sid      = "ReadComposeObject",
+        Effect   = "Allow",
+        Action   = ["s3:GetObject"],
+        Resource = "arn:aws:s3:::${local.docker_backup_bucket}/${var.environment}/*"
+      }
+    ]
+  })
+}
+
+
 resource "aws_iam_role_policy_attachment" "s3_docker_backup_access" {
   role       = aws_iam_role.ec2_ssm_role.name
   policy_arn = aws_iam_policy.s3_docker_backup_access.arn
 }
+
+
 
 #  ECR Pull Access
 resource "aws_iam_policy" "ecr_pull" {
@@ -174,4 +213,10 @@ resource "aws_iam_policy" "ssm_get_parameter" {
 resource "aws_iam_role_policy_attachment" "ssm_get_parameter_attach" {
   role       = aws_iam_role.ec2_ssm_role.name
   policy_arn = aws_iam_policy.ssm_get_parameter.arn
+}
+
+data "aws_caller_identity" "current" {}
+
+locals {
+  docker_backup_bucket = "idlms-${var.environment}-built-artifact-${data.aws_caller_identity.current.account_id}"
 }
