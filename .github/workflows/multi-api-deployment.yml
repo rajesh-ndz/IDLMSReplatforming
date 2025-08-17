@@ -14,7 +14,7 @@ on:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  TF_BUCKET: ${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-592776312448
+  TF_BUCKET: ${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-${ACCOUNT_ID}
   TF_REGION: ${{ vars.AWS_REGION }}
  
 
