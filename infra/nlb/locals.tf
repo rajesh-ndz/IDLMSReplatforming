@@ -46,8 +46,3 @@ locals {
   ]
 
 }
-
-locals {
-  nlb_dns_name         = try(data.terraform_remote_state.nlb.outputs.nlb_dns_name, data.terraform_remote_state.nlb.outputs.lb_dns_name)
-  vpc_link_target_arns = [try(data.terraform_remote_state.nlb.outputs.nlb_arn, data.terraform_remote_state.nlb.outputs.lb_arn)]
-}
