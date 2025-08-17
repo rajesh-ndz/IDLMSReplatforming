@@ -210,78 +210,86 @@ jobs:
       #      --timeout-seconds 900 \
       #      --region "$AWS_REGION"
 
+      - name: Verify docker-compose.yml exists in S3
+        run: |
+          aws s3 ls "s3://$BACKUP_BUCKET/${{ github.event.inputs.ENV }}/docker-compose.yml" --region "${{ env.AWS_REGION }}"
 
-    
-      # ⬇️ Replace your old deploy step with THIS fixed one
+          
+        # ⬇️ Replace your old deploy step with THIS fixed one
       - name: Deploy containers with rollback logic via SSM (wait for completion)
         run: |
           set -euo pipefail
           TAG_TO_DEPLOY="${{ env.TAG_TO_DEPLOY }}"
           ENV="${{ github.event.inputs.ENV }}"
-          ECR_REPO_URL="${{ env.ECR_REPO_URL }}"
-          AWS_REGION="${{ env.AWS_REGION }}"
+          ECR_  REPO_URL="${{ env.ECR_REPO_URL }}"
+          AWS_  REGION="${{ env.AWS_REGION }}"
           BACKUP_BUCKET="${{ env.BACKUP_BUCKET }}"
-              
+
           # Find newest running instance
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV}" "Name=instance-state-name,Values=running" \
             --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
             --region "$AWS_REGION" --output text)
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "::error::No running EC2 instance found for environment $ENV"
-            exit 1
+            ec  ho "::error::No running EC2 instance found for environment $ENV"
+            ex  it 1
           fi
-              
+
           # Ensure envsubst exists
-          if ! command -v envsubst >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y gettext-base
+          if !   command -v envsubst >/dev/null 2>&1; then
+            su  do apt-get update -y && sudo apt-get install -y gettext-base
           fi
-              
-          # Precompute registry to avoid ${VAR%/*} expansion conflicts with envsubst
+
+          # Pr  ecompute registry to avoid ${VAR%/*} expansion conflicts with envsubst
           ECR_REGISTRY="${ECR_REPO_URL%/*}"
-              
+
           # Write template WITHOUT expansion; substitute only the placeholders we list
           cat > deploy.tmpl <<'JSON'
           {
             "commands": [
-              "set -e",
-              "cd /home/ubuntu || cd $HOME || true",
+                "set -e",
+                "export DEBIAN_FRONTEND=noninteractive",
+                "cd /home/ubuntu || cd $HOME || true",
             
-              "if ! command -v docker >/dev/null 2>&1; then if [ -f /etc/debian_version ]; then apt-get update -y && apt-get install -y docker.io; else (command -v yum >/dev/null 2>&1 && yum install -y docker) || amazon-linux-extras install -y docker || true; systemctl enable docker || true; systemctl start docker || true; fi; fi",
+                "if ! command -v docker >/dev/null 2>&1; then if [ -f /etc/debian_version ]; then apt-get update -y && apt-get install -y docker.io; else (command -v yum >/dev/null 2>&1 && yum install -y docker) || amazon-linux-extras install -y docker || true; systemctl enable docker || true; systemctl start docker || true; fi; fi",
             
               "if ! command -v docker-compose >/dev/null 2>&1; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
             
               "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV}/.env\" --with-decryption --query \"Parameter.Value\" --output text)",
-              "printf \"%s\n\" \"$ENV_CONTENT\" > .env",
-              "echo \"BUILD_TAG=${TAG_TO_DEPLOY}\" >> .env",
+                "printf \"%s\n\" \"$ENV_CONTENT\" > .env",
+                "echo \"BUILD_TAG=${TAG_TO_DEPLOY}\" >> .env",
               "echo \"IMAGE_REPO=${ECR_REPO_URL}\" >> .env",
-              "aws s3 cp s3://${BACKUP_BUCKET}/${ENV}/docker-compose.yml docker-compose.yml",
+            
+              "echo '--- S3 preflight ---'",
+                "aws sts get-caller-identity",
+                "aws s3api head-object --bucket ${BACKUP_BUCKET} --key ${ENV}/docker-compose.yml --region ${AWS_REGION} || { echo 'ERROR: Instance role cannot read docker-compose.yml (check S3 perms/KMS).'; exit 1; }",
+                "aws s3 cp s3://${BACKUP_BUCKET}/${ENV}/docker-compose.yml docker-compose.yml --region ${AWS_REGION}",
             
               "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}",
             
               "docker-compose --env-file .env down || true",
-              "docker rmi ${ECR_REPO_URL}:${TAG_TO_DEPLOY} || true",
-              "docker-compose --env-file .env pull --ignore-pull-failures",
-              "docker-compose --env-file .env up -d --force-recreate --build",
+                "docker rmi ${ECR_REPO_URL}:${TAG_TO_DEPLOY} || true",
+                "docker-compose --env-file .env pull --ignore-pull-failures",
+                "docker-compose --env-file .env up -d --force-recreate --build",
             
               "sleep 60",
             
               "RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E \"^api1$|^api2$|^api3$\" | wc -l) || true",
               "if [ \"$RUNNING_CONTAINERS\" -ne 3 ]; then echo \"Deployment failed. Rolling back...\"; PREV_TAG=$(aws ssm get-parameter --name \"/idlms/license-api/last-successful-build\" --query \"Parameter.Value\" --output text); echo \"Rolling back to tag: $PREV_TAG\"; sed -i \"/^BUILD_TAG=/d\" .env; echo \"BUILD_TAG=$PREV_TAG\" >> .env; docker-compose --env-file .env down || true; docker rmi ${ECR_REPO_URL}:${TAG_TO_DEPLOY} || true; docker-compose --env-file .env pull --ignore-pull-failures; docker-compose --env-file .env up -d --force-recreate --build; else echo \"All containers are up. Saving ${TAG_TO_DEPLOY} as last-successful-build...\"; aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \"${TAG_TO_DEPLOY}\" --type String --overwrite; fi"
-            ]
-          }
+              ]
+          } 
           JSON
             
-          # Substitute ONLY these vars (keeps $HOME and $(uname ...) intact for the instance)
-          export ENV TAG_TO_DEPLOY ECR_REPO_URL AWS_REGION BACKUP_BUCKET ECR_REGISTRY
+          #   Substitute ONLY these vars (keeps $HOME and $(uname ...) intact for the instance)
+          ex  port ENV TAG_TO_DEPLOY ECR_REPO_URL AWS_REGION BACKUP_BUCKET ECR_REGISTRY
           envsubst '${ENV},${TAG_TO_DEPLOY},${ECR_REPO_URL},${AWS_REGION},${BACKUP_BUCKET},${ECR_REGISTRY}' < deploy.tmpl > deploy.json
             
           CMD_ID=$(aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$INSTANCE_ID" \
             --comment "Deploy containers with rollback logic" \
-            --parameters file://deploy.json \
-            --query "Command.CommandId" --output text --region "$AWS_REGION")
+              --parameters file://deploy.json \
+              --query "Command.CommandId" --output text --region "$AWS_REGION")
           echo "SSM CommandId: $CMD_ID"
             
           # wait for completion
@@ -292,25 +300,24 @@ jobs:
             case "$STATUS" in
               Pending|InProgress|Delayed) sleep 10 ;;
               Success|Cancelled|TimedOut|Failed) break ;;
-              *) sleep 10 ;;
-            esac
+                *) sleep 10 ;;
+              esac
           done
             
-          echo "----- SSM STDOUT -----"
-          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+          ec  ho "----- SSM STDOUT -----"
+          aw  s ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
             --region "$AWS_REGION" --query 'StandardOutputContent' --output text || true
             
-          echo "----- SSM STDERR -----"
-          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+          ec  ho "----- SSM STDERR -----"
+          aw  s ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
             --region "$AWS_REGION" --query 'StandardErrorContent' --output text || true
             
           if [ "$STATUS" != "Success" ]; then
-            echo "::error::Deploy SSM command failed ($STATUS)"
-            exit 1
+              echo "::error::Deploy SSM command failed ($STATUS)"
+              exit 1
           fi
-            
-  
-          
+
+
       
   verify:
      name: Post-deploy health check
