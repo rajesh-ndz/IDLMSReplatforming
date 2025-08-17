@@ -1,4 +1,4 @@
-tf_state_bucket    = "{{env}}-btl-idlms-backend-api-tfstate"
+tf_state_bucket    = "{{env}}-btl-idlms-backend-api-tfstate-${{ secrets.AWS_ACCOUNT_ID }}"
 environment        = "{{env}}"
 region             = "ap-southeast-1"
 tf_state_region    = "ap-southeast-1"
