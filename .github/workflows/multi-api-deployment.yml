@@ -16,7 +16,6 @@ env:
   TF_BUCKET: ${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-${{ secrets.AWS_ACCOUNT_ID }}
   TF_REGION: ${{ vars.AWS_REGION }}
  
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -48,6 +47,7 @@ jobs:
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT" 
+
       - name: Set dynamic backup bucket name
         run: echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV              
 
@@ -57,12 +57,14 @@ jobs:
           cd infra/vpc
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+
       - name: Terraform Apply NLB
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
         run: |
           cd infra/nlb
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/nlb/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+
       - name: Terraform Apply API Gateway
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
         run: |
@@ -70,12 +72,14 @@ jobs:
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/rest-api/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform refresh -var-file="${{ github.event.inputs.ENV }}.tfvars"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+
       - name: Terraform Apply CloudWatch
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
         run: |
           cd infra/cloudwatch
           terraform init -backend-config="bucket=${TF_BUCKET}" -backend-config="key=${{ github.event.inputs.ENV }}/cloudwatch/terraform.tfstate" -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+
       - name: Terraform Apply ECR
         id: ecr
         run: |
@@ -90,6 +94,7 @@ jobs:
           echo "ECR_REPO_URL=$ECR_REPO_URL" >> $GITHUB_ENV
           echo $ECR_REPO_URL
           echo $GITHUB_ENV
+
       - name: Terraform Apply SSM
         id: ssm
         run: |
@@ -105,6 +110,7 @@ jobs:
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars" -var="app_env_content=${BASE64_ENV}"
           SSM_ENV_PARAM=$(terraform output -raw ssm_env_param_name | tr -d '\r\n' | sed 's/^ssm:\/\///')
           echo "SSM_ENV_PARAM=$SSM_ENV_PARAM" >> $GITHUB_ENV
+
       - name: Terraform Apply S3
         id: s3_apply
         run: |
@@ -118,7 +124,6 @@ jobs:
           echo "Uploading to bucket: $BACKUP_BUCKET"
           aws s3 cp docker/docker-compose.yml s3://$BACKUP_BUCKET/${{ github.event.inputs.ENV }}/docker-compose.yml   
       
-          
       - name: Print ECR URL
         run: echo "Using ECR:$ECR_REPO_URL"
         
@@ -138,6 +143,7 @@ jobs:
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
           echo "LATEST_URI=$LATEST_URI" >> $GITHUB_ENV
           echo "BUILD_TAG=$BUILD_TAG" >> $GITHUB_ENV
+
       - name: Build and tag Docker image
         run: docker build -t $IMAGE_URI -t $LATEST_URI -f docker/Dockerfile src
 
@@ -145,6 +151,7 @@ jobs:
         run: |
           docker push $IMAGE_URI
           docker push $LATEST_URI
+          
       - name: Determine tag to deploy
         id: determine-tag
         run: |
