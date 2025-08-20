@@ -51,6 +51,28 @@ jobs:
       - name: Set dynamic backup bucket name
         run: echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV              
 
+      - name: Terraform Import IAM Role and Policies
+        run: |
+          cd infra/ssm
+          terraform init \
+            -backend-config="bucket=${TF_BUCKET}" \
+            -backend-config="key=${{ github.event.inputs.ENV }}/ssm/terraform.tfstate" \
+            -backend-config="region=${TF_REGION}"
+
+          ACCOUNT_ID="${{ steps.aws-account.outputs.account_id }}"
+          ENV="${{ github.event.inputs.ENV }}"
+
+          terraform import aws_iam_role.ec2_ssm_role ec2_ssm_role-${ENV} || true
+
+          terraform import aws_iam_policy.s3_docker_backup_access arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-s3-docker-backup-access || true
+          terraform import aws_iam_policy.ecr_pull arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-ecr-pull-access || true
+          terraform import aws_iam_policy.elb_describe arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-elb-describe-access || true
+          terraform import aws_iam_policy.ssm_debug arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-ssm-describe-instance || true
+          terraform import aws_iam_policy.ec2_describe arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-describe-instances || true
+          terraform import aws_iam_policy.ssm_get_parameter arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-ssm-get-parameter || true
+
+
+
       - name: Terraform Apply VPC
         if: github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.modified), 'infra/')
         run: |
@@ -96,27 +118,7 @@ jobs:
           echo $GITHUB_ENV
 
 
-      - name: Terraform Import IAM Role and Policies
-        run: |
-          cd infra/ssm
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ssm/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-
-          ACCOUNT_ID="${{ steps.aws-account.outputs.account_id }}"
-          ENV="${{ github.event.inputs.ENV }}"
-
-          terraform import aws_iam_role.ec2_ssm_role ec2_ssm_role-${ENV} || true
-
-          terraform import aws_iam_policy.s3_docker_backup_access arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-s3-docker-backup-access || true
-          terraform import aws_iam_policy.ecr_pull arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-ecr-pull-access || true
-          terraform import aws_iam_policy.elb_describe arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-elb-describe-access || true
-          terraform import aws_iam_policy.ssm_debug arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-ssm-describe-instance || true
-          terraform import aws_iam_policy.ec2_describe arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-describe-instances || true
-          terraform import aws_iam_policy.ssm_get_parameter arn:aws:iam::$ACCOUNT_ID:policy/${ENV}-ec2-ssm-get-parameter || true
-
-
+      
       - name: Terraform Apply SSM
         id: ssm
         run: |
