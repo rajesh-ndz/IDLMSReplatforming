@@ -147,14 +147,17 @@ jobs:
           docker push $IMAGE_URI
           docker push $LATEST_URI
           
-      - name: Determine tag to deploy
+      - name: Determine tag to deplo
         id: determine-tag
+        shell: bash
         run: |
-          TAG="${{ github.event.inputs.ROLLBACK_TAG }}"
-          if [ -z "$TAG" ]; then
+          if [ -n "${{ github.event.inputs.ROLLBACK_TAG }}" ]; then
+            TAG="${{ github.event.inputs.ROLLBACK_TAG }}"
+          else
             TAG="${{ env.BUILD_TAG }}"
           fi
           echo "TAG_TO_DEPLOY=$TAG" >> $GITHUB_ENV
+          echo "Deploying TAG_TO_DEPLOY=$TAG"
 
       - name: Deploy containers with rollback logic via SSM
         run: |
@@ -191,7 +194,7 @@ jobs:
               "docker-compose --env-file .env down || true",
               "docker rmi ${IMAGE_REPO}:${BUILD_TAG} || true",
               "docker-compose --env-file .env pull --ignore-pull-failures",
-              "docker-compose --env-file .env up -d --force-recreate --build",
+              "docker-compose --env-file .env up -d --force-recreate",
               "sleep 60",
               "RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E \\\"api1|api2|api3\\\" | wc -l) && \
               if [ \\\"$RUNNING_CONTAINERS\\\" -ne 3 ]; then \
@@ -203,7 +206,7 @@ jobs:
                docker-compose --env-file .env down || true; \
                docker rmi ${IMAGE_REPO}:${BUILD_TAG} || true; \
                docker-compose --env-file .env pull --ignore-pull-failures; \
-               docker-compose --env-file .env up -d --force-recreate --build; \
+               docker-compose --env-file .env up -d --force-recreate; \
              else \
                echo \\\"All containers are up. Saving $TAG_TO_DEPLOY as last-successful-build...\\\"; \
                aws ssm put-parameter --name \\\"/idlms/license-api/last-successful-build\\\" --value \\\"$TAG_TO_DEPLOY\\\" --type String --overwrite; \
