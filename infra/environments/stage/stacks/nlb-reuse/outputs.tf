@@ -17,3 +17,8 @@ output "target_group_arns" {
   value     = module.nlb_ssm.target_group_arns
   sensitive = true
 }
+
+# Derived from AWS using the ARN; not sensitive
+output "lb_zone_id" {
+  value = data.aws_lb.nlb.zone_id
+}

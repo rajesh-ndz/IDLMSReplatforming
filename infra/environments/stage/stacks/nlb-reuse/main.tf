@@ -8,6 +8,11 @@ locals {
 }
 
 module "nlb_ssm" {
+
+# Look up the NLB to get hosted zone id (non-sensitive)
+data "aws_lb" "nlb" {
+  arn = nonsensitive(module.nlb_ssm.lb_arn)
+}
   source = "../../../../../modules/platform-ssm-reuse"
 
   region         = local.region
