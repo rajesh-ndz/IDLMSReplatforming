@@ -3,24 +3,13 @@ terraform {
 }
 
 locals {
-  platform_state_bucket  = "idlms-terraform-state-backend"
-  platform_state_region  = "ap-south-1"
-  platform_nlb_state_key = "stage/container/nlb/terraform.tfstate"
+  nlb_ssm_prefix = "/idlms/nlb/stage"
+  region         = "ap-south-1"
 }
 
-data "terraform_remote_state" "nlb" {
-  backend = "s3"
-  config = {
-    bucket = local.platform_state_bucket
-    key    = local.platform_nlb_state_key
-    region = local.platform_state_region
-  }
-}
+module "nlb_ssm" {
+  source = "../../../../../modules/platform-ssm-reuse"
 
-locals {
-  lb_arn            = try(data.terraform_remote_state.nlb.outputs.lb_arn, null)
-  lb_dns_name       = try(data.terraform_remote_state.nlb.outputs.lb_dns_name, null)
-  lb_zone_id        = try(data.terraform_remote_state.nlb.outputs.lb_zone_id, null)
-  target_group_arns = try(data.terraform_remote_state.nlb.outputs.target_group_arns, {})
-  listener_arns     = try(data.terraform_remote_state.nlb.outputs.listener_arns, {})
+  region         = local.region
+  nlb_ssm_prefix = local.nlb_ssm_prefix
 }
