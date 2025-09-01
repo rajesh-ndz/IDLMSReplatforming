@@ -12,7 +12,7 @@ on:
         required: false
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}   # e.g., ap-south-1
+  AWS_REGION: ${{ vars.AWS_REGION }}
 
 concurrency:
   group: deploy-${{ github.ref_name }}-${{ github.event.inputs.ENV || 'stage' }}
@@ -55,25 +55,33 @@ jobs:
           echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
           echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${ACCOUNT_ID}" >> "$GITHUB_ENV"
 
-      # --- APPLY REUSE STACKS (read-only to platform-main state/SSM) ---
-      - name: Terraform apply reuse stacks
+      - name: Terraform apply reuse stacks (read-only)
         run: |
           set -euo pipefail
           ROOT="infra/environments/stage/stacks"
-          EXPECTED_NLB_FILES="backend.tf providers.tf main.tf outputs.tf"
+          NLB_EXPECTED="backend.tf providers.tf main.tf outputs.tf"
+          ECR_EXPECTED="backend.tf providers.tf variables.tf main.tf outputs.tf"
 
           for s in network-reuse compute-reuse nlb-reuse ecr-reuse s3-reuse restapi-reuse cloudwatch-reuse ssm-reuse; do
             echo "=== $s ==="
 
+            # Keep only expected files for nlb-reuse (avoid stray files from previous attempts)
             if [ "$s" = "nlb-reuse" ]; then
-              # Keep only the four expected files (avoid stray .tf on the runner)
               if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
                 for f in "$ROOT/$s"/*.tf; do
                   base=$(basename "$f")
-                  case " $EXPECTED_NLB_FILES " in
-                    *" $base "*) : ;;
-                    *) echo "Removing unexpected: $base"; rm -f "$f" ;;
-                  esac
+                  case " $NLB_EXPECTED " in *" $base "*) : ;; *) echo "Removing unexpected (nlb-reuse): $base"; rm -f "$f" ;; esac
+                done
+              fi
+            fi
+
+            # Keep only expected files for ecr-reuse (avoid duplicates/provider tf)
+            if [ "$s" = "ecr-reuse" ]; then
+              rm -rf "$ROOT/$s/infra" || true
+              if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
+                for f in "$ROOT/$s"/*.tf; do
+                  base=$(basename "$f")
+                  case " $ECR_EXPECTED " in *" $base "*) : ;; *) echo "Removing unexpected (ecr-reuse): $base"; rm -f "$f" ;; esac
                 done
               fi
             fi
@@ -167,55 +175,88 @@ jobs:
             exit 1
           fi
 
-          # Build SSM parameters JSON (commands list) WITHOUT heredoc
-          PARAMS_JSON=$(jq -n \
-            --arg env     "$ENV" \
-            --arg ecr     "$ECR_REPO_URL" \
-            --arg tag     "$TAG_TO_DEPLOY" \
-            --arg region  "$AWS_REGION" \
-            --arg bucket  "$BACKUP_BUCKET" \
-            '{
-               commands: [
-                 "set -e",
-                 "cd /home/ubuntu",
-                 "ENV_NAME="    + $env,
-                 "ECR_REPO_URL="+ $ecr,
-                 "TAG_TO_DEPLOY="+ $tag,
-                 "AWS_REGION="  + $region,
-                 "BACKUP_BUCKET="+ $bucket,
+          # Build a YAML-safe command payload for SSM
+          REMOTE_SCRIPT=$(cat <<'EOS'
+          set -e
+          cd /home/ubuntu
 
-                 "if aws ssm get-parameter --name \"/idlms/shared/${ENV_NAME}/.env\" --with-decryption >/dev/null 2>&1; then ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV_NAME}/.env\" --with-decryption --query \"Parameter.Value\" --output text); else ENV_CONTENT=\"# placeholder env\"; fi",
-                 "printf \"%s\\n\" \"$ENV_CONTENT\" > .env",
-                 "echo \"BUILD_TAG=${TAG_TO_DEPLOY}\" >> .env",
-                 "echo \"IMAGE_REPO=${ECR_REPO_URL}\" >> .env",
+          ENV_NAME="__ENV__"
+          ECR_REPO_URL="__ECR__"
+          TAG_TO_DEPLOY="__TAG__"
+          AWS_REGION="__REGION__"
+          BACKUP_BUCKET="__BUCKET__"
 
-                 "aws s3 cp \"s3://${BACKUP_BUCKET}/${ENV_NAME}/docker-compose.yml\" docker-compose.yml",
+          # Pull env from SSM if present
+          if aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption >/dev/null 2>&1; then
+            ENV_CONTENT=$(aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption --query "Parameter.Value" --output text)
+          else
+            ENV_CONTENT="# placeholder env"
+          fi
+          printf "%s\n" "$ENV_CONTENT" > .env
+          echo "BUILD_TAG=${TAG_TO_DEPLOY}" >> .env
+          echo "IMAGE_REPO=${ECR_REPO_URL}" >> .env
 
-                 "if ! command -v docker >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
-                 "if ! command -v docker-compose >/dev/null 2>&1; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose; fi",
+          # Compose file from S3
+          aws s3 cp "s3://${BACKUP_BUCKET}/${ENV_NAME}/docker-compose.yml" docker-compose.yml
 
-                 "aws ecr get-login-password --region \"${AWS_REGION}\" | docker login --username AWS --password-stdin \"${ECR_REPO_URL%/*}\"",
+          # Ensure docker & docker-compose
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y docker.io
+          fi
+          if ! command -v docker-compose >/dev/null 2>&1; then
+            curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+            ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+          fi
 
-                 "CURRENT_IMG=\"${ECR_REPO_URL}:${TAG_TO_DEPLOY}\"",
-                 "docker-compose --env-file .env down || true",
-                 "docker rmi \"${CURRENT_IMG}\" || true",
+          # Login to ECR
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REPO_URL%/*}"
 
-                 "docker-compose --env-file .env pull --ignore-pull-failures",
-                 "docker-compose --env-file .env up -d --force-recreate",
+          # Stop current stack and remove the currently targeted image tag
+          CURRENT_IMG="${ECR_REPO_URL}:${TAG_TO_DEPLOY}"
+          docker-compose --env-file .env down || true
+          docker rmi "${CURRENT_IMG}" || true
 
-                 "sleep 60",
-                 "RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E \"api1|api2|api3\" | wc -l)",
+          # Deploy
+          docker-compose --env-file .env pull --ignore-pull-failures
+          docker-compose --env-file .env up -d --force-recreate
 
-                 "if [ \"$RUNNING_CONTAINERS\" -ne 3 ]; then echo \"Deployment failed. Rolling back...\"; PREV_TAG=$(aws ssm get-parameter --name \"/idlms/license-api/last-successful-build\" --query \"Parameter.Value\" --output text || echo \"\"); if [ -z \"$PREV_TAG\" ]; then echo \"No last-successful-build found; leaving services down for safety.\"; exit 1; fi; sed -i \"/^BUILD_TAG=/d\" .env; echo \"BUILD_TAG=$PREV_TAG\" >> .env; PREV_IMG=\"${ECR_REPO_URL}:$PREV_TAG\"; docker-compose --env-file .env down || true; docker rmi \"${CURRENT_IMG}\" || true; docker-compose --env-file .env pull --ignore-pull-failures; docker-compose --env-file .env up -d --force-recreate; else echo \"All containers are up. Saving ${TAG_TO_DEPLOY} as last-successful-build...\"; aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \"${TAG_TO_DEPLOY}\" --type String --overwrite; fi"
-               ]
-             }')
+          # Health check: expect 3 containers (api1, api2, api3)
+          sleep 60
+          RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E "api1|api2|api3" | wc -l)
+          if [ "$RUNNING_CONTAINERS" -ne 3 ]; then
+            echo "Deployment failed. Rolling back..."
+            PREV_TAG=$(aws ssm get-parameter --name "/idlms/license-api/last-successful-build" --query "Parameter.Value" --output text || echo "")
+            if [ -z "$PREV_TAG" ]; then
+              echo "No last-successful-build found; leaving services down for safety."
+              exit 1
+            fi
+            sed -i "/^BUILD_TAG=/d" .env
+            echo "BUILD_TAG=$PREV_TAG" >> .env
+            PREV_IMG="${ECR_REPO_URL}:${PREV_TAG}"
+            docker-compose --env-file .env down || true
+            docker rmi "${CURRENT_IMG}" || true
+            docker-compose --env-file .env pull --ignore-pull-failures
+            docker-compose --env-file .env up -d --force-recreate
+          else
+            echo "All containers are up. Saving ${TAG_TO_DEPLOY} as last-successful-build..."
+            aws ssm put-parameter --name "/idlms/license-api/last-successful-build" --value "${TAG_TO_DEPLOY}" --type String --overwrite
+          fi
+          EOS
+          )
 
-          echo "$PARAMS_JSON" > params.json
+          # Fill placeholders with runtime values (bash string replacement; safe for slashes)
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__ENV__/${ENV}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__ECR__/${ECR_REPO_URL}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__TAG__/${TAG_TO_DEPLOY}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__REGION__/${AWS_REGION}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__BUCKET__/${BACKUP_BUCKET}}"
 
+          # Send to SSM as a single encoded string
           aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$INSTANCE_ID" \
             --comment "Deploy containers with rollback logic" \
-            --parameters file://params.json \
+            --parameters commands="$(jq -Rn --arg s "$REMOTE_SCRIPT" '$s')" \
             --timeout-seconds 1200 \
             --region "$AWS_REGION"
