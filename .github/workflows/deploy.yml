@@ -138,6 +138,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Find the instance
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV}" "Name=instance-state-name,Values=running" \
             --query "Reservations[].Instances[].InstanceId" \
@@ -145,9 +146,12 @@ jobs:
             --output text)
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "ERROR: No running EC2 instance found for environment $ENV"; exit 1
+            echo "ERROR: No running EC2 instance found for environment $ENV"
+            exit 1
           fi
 
+          # Build the remote script as a single variable via heredoc.
+          # IMPORTANT: The closing EOS and the closing parenthesis must be indented to stay inside this YAML block.
           REMOTE_SCRIPT=$(cat <<'EOS'
           set -e
           cd /home/ubuntu
@@ -158,6 +162,7 @@ jobs:
           AWS_REGION="__REGION__"
           BACKUP_BUCKET="__BUCKET__"
 
+          # Pull env from SSM if present
           if aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption >/dev/null 2>&1; then
             ENV_CONTENT=$(aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption --query "Parameter.Value" --output text)
           else
@@ -167,8 +172,10 @@ jobs:
           echo "BUILD_TAG=${TAG_TO_DEPLOY}" >> .env
           echo "IMAGE_REPO=${ECR_REPO_URL}" >> .env
 
+          # Compose file from S3
           aws s3 cp "s3://${BACKUP_BUCKET}/${ENV_NAME}/docker-compose.yml" docker-compose.yml
 
+          # Ensure docker & docker-compose
           if ! command -v docker >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y docker.io
           fi
@@ -178,15 +185,19 @@ jobs:
             ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
           fi
 
+          # Login to ECR
           aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REPO_URL%/*}"
 
+          # Stop current stack and remove the currently targeted image tag
           CURRENT_IMG="${ECR_REPO_URL}:${TAG_TO_DEPLOY}"
           docker-compose --env-file .env down || true
           docker rmi "${CURRENT_IMG}" || true
 
+          # Deploy
           docker-compose --env-file .env pull --ignore-pull-failures
           docker-compose --env-file .env up -d --force-recreate
 
+          # Health check: expect 3 containers (api1, api2, api3)
           sleep 60
           RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E "api1|api2|api3" | wc -l)
           if [ "$RUNNING_CONTAINERS" -ne 3 ]; then
@@ -207,14 +218,17 @@ jobs:
             echo "All containers are up. Saving ${TAG_TO_DEPLOY} as last-successful-build..."
             aws ssm put-parameter --name "/idlms/license-api/last-successful-build" --value "${TAG_TO_DEPLOY}" --type String --overwrite
           fi
-EOS
-)
+          EOS
+          )
+
+          # Fill placeholders with runtime values
           REMOTE_SCRIPT="${REMOTE_SCRIPT/__ENV__/${ENV}}"
           REMOTE_SCRIPT="${REMOTE_SCRIPT/__ECR__/${ECR_REPO_URL}}"
           REMOTE_SCRIPT="${REMOTE_SCRIPT/__TAG__/${TAG_TO_DEPLOY}}"
           REMOTE_SCRIPT="${REMOTE_SCRIPT/__REGION__/${AWS_REGION}}"
           REMOTE_SCRIPT="${REMOTE_SCRIPT/__BUCKET__/${BACKUP_BUCKET}}"
 
+          # Send to SSM as a single command string (jq encodes it as JSON)
           aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$INSTANCE_ID" \
