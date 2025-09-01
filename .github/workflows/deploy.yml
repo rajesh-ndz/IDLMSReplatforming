@@ -71,7 +71,7 @@ jobs:
               echo "--- grep for check/pre/postcondition ---"
               (grep -RInE '\bcheck\b|precondition|postcondition' "$ROOT/$s" && echo "::warning::Found check/pre/postcondition in nlb-reuse") || true
 
-              # Keep only the 5 expected files (avoid stray .tf picked up on runner)
+              # Keep only the 4 expected files (avoid stray .tf picked up on runner)
               if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
                 for f in "$ROOT/$s"/*.tf; do
                   base=$(basename "$f")
