@@ -1,11 +1,8 @@
-terraform { required_version = ">= 1.5.0" }
-
 locals {
-  platform_state_bucket  = "idlms-terraform-state-backend"
-  platform_state_region  = "ap-south-1"
-  platform_ecr_state_key = "stage/ecr/terraform.tfstate"
+  platform_state_bucket  = var.platform_state_bucket
+  platform_state_region  = var.platform_state_region
+  platform_ecr_state_key = var.platform_ecr_state_key
 }
-
 data "terraform_remote_state" "ecr" {
   backend = "s3"
   config = {
