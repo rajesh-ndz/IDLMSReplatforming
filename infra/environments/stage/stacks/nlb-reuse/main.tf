@@ -2,7 +2,6 @@ terraform {
   required_version = ">= 1.5.0"
 }
 
-# Read the NLB outputs directly from platform-main's state
 data "terraform_remote_state" "nlb" {
   backend = "s3"
   config = {
