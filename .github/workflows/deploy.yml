@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           ROOT="infra/environments/stage/stacks"
-          EXPECTED_NLB_FILES="backend.tf providers.tf variables.tf main.tf outputs.tf"
+          EXPECTED_NLB_FILES="backend.tf providers.tf main.tf outputs.tf"
 
           for s in network-reuse compute-reuse nlb-reuse ecr-reuse s3-reuse restapi-reuse cloudwatch-reuse ssm-reuse; do
             echo "=== $s ==="
