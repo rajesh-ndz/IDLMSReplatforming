@@ -58,14 +58,19 @@ jobs:
       - name: Terraform apply reuse stacks (read-only)
         run: |
           set -euo pipefail
+
           ROOT="infra/environments/stage/stacks"
           NLB_EXPECTED="backend.tf providers.tf main.tf outputs.tf"
-          ECR_EXPECTED="backend.tf providers.tf variables.tf main.tf outputs.tf"
+          ECR_EXPECTED="backend.tf providers.tf main.tf outputs.tf"
 
-          for s in network-reuse compute-reuse nlb-reuse ecr-reuse s3-reuse restapi-reuse cloudwatch-reuse ssm-reuse; do
+          stacks="network-reuse compute-reuse nlb-reuse ecr-reuse"
+          for s in $stacks; do
             echo "=== $s ==="
 
-            # Keep only expected files for nlb-reuse (avoid stray files from previous attempts)
+            # Skip gracefully if stack dir is absent
+            [ -d "$ROOT/$s" ] || { echo "Skipping $s (no dir)"; continue; }
+
+            # NLB: keep only whitelisted files
             if [ "$s" = "nlb-reuse" ]; then
               if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
                 for f in "$ROOT/$s"/*.tf; do
@@ -75,7 +80,7 @@ jobs:
               fi
             fi
 
-            # Keep only expected files for ecr-reuse (avoid duplicates/provider tf)
+            # ECR: remove nested junk, and keep only whitelisted files
             if [ "$s" = "ecr-reuse" ]; then
               rm -rf "$ROOT/$s/infra" || true
               if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
@@ -153,54 +158,101 @@ jobs:
           echo "TAG_TO_DEPLOY=$TAG_TO_DEPLOY" >> "$GITHUB_ENV"
           echo "Deploying tag: $TAG_TO_DEPLOY"
 
-      - name: Terraform apply reuse stacks (read-only)
+      - name: Deploy containers via SSM with rollback
+        env:
+          ENV:            ${{ github.event.inputs.ENV }}
+          ECR_REPO_URL:   ${{ env.ECR_REPO_URL }}
+          AWS_REGION:     ${{ env.AWS_REGION }}
+          BACKUP_BUCKET:  ${{ env.BACKUP_BUCKET }}
+          TAG_TO_DEPLOY:  ${{ env.TAG_TO_DEPLOY }}
         run: |
           set -euo pipefail
-          ROOT="infra/environments/stage/stacks"
-          NLB_EXPECTED="backend.tf providers.tf main.tf outputs.tf"
-          ECR_EXPECTED="backend.tf providers.tf variables.tf main.tf outputs.tf"
 
-          for s in network-reuse compute-reuse nlb-reuse ecr-reuse s3-reuse restapi-reuse cloudwatch-reuse ssm-reuse; do
-            echo "=== $s ==="
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --region "$AWS_REGION" --output text)
 
-            if [ "$s" = "nlb-reuse" ]; then
-              echo "--- NLB BEFORE cleanup ---"
-              ls -la "$ROOT/$s" || true
-              (grep -RInE '\bcheck\b|precondition|postcondition' "$ROOT/$s" && echo "::warning::Found check/pre/postcondition in nlb-reuse") || true
-              if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
-                for f in "$ROOT/$s"/*.tf; do
-                  base=$(basename "$f")
-                  case " $NLB_EXPECTED " in *" $base "*) : ;; *) echo "Removing unexpected (nlb-reuse): $base"; rm -f "$f" ;; esac
-                done
-              fi
-              echo "--- NLB AFTER cleanup ---"
-              ls -la "$ROOT/$s" || true
-              for f in $NLB_EXPECTED; do echo "----- $f -----"; sed -n '1,200p' "$ROOT/$s/$f" || true; done
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "ERROR: No running EC2 instance found for environment $ENV"
+            exit 1
+          fi
+
+          # Build remote script
+          REMOTE_SCRIPT=$(cat <<'EOS'
+          set -e
+          cd /home/ubuntu
+
+          ENV_NAME="__ENV__"
+          ECR_REPO_URL="__ECR__"
+          TAG_TO_DEPLOY="__TAG__"
+          AWS_REGION="__REGION__"
+          BACKUP_BUCKET="__BUCKET__"
+
+          if aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption >/dev/null 2>&1; then
+            ENV_CONTENT=$(aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption --query "Parameter.Value" --output text)
+          else
+            ENV_CONTENT="# placeholder env"
+          fi
+          printf "%s\n" "$ENV_CONTENT" > .env
+          echo "BUILD_TAG=${TAG_TO_DEPLOY}" >> .env
+          echo "IMAGE_REPO=${ECR_REPO_URL}" >> .env
+
+          aws s3 cp "s3://${BACKUP_BUCKET}/${ENV_NAME}/docker-compose.yml" docker-compose.yml
+
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y docker.io
+          fi
+          if ! command -v docker-compose >/dev/null 2>&1; then
+            curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+            ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+          fi
+
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REPO_URL%/*}"
+
+          CURRENT_IMG="${ECR_REPO_URL}:${TAG_TO_DEPLOY}"
+          docker-compose --env-file .env down || true
+          docker rmi "${CURRENT_IMG}" || true
+
+          docker-compose --env-file .env pull --ignore-pull-failures
+          docker-compose --env-file .env up -d --force-recreate
+
+          sleep 60
+          RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E "api1|api2|api3" | wc -l)
+          if [ "$RUNNING_CONTAINERS" -ne 3 ]; then
+            echo "Deployment failed. Rolling back..."
+            PREV_TAG=$(aws ssm get-parameter --name "/idlms/license-api/last-successful-build" --query "Parameter.Value" --output text || echo "")
+            if [ -z "$PREV_TAG" ]; then
+              echo "No last-successful-build found; leaving services down for safety."
+              exit 1
             fi
+            sed -i "/^BUILD_TAG=/d" .env
+            echo "BUILD_TAG=$PREV_TAG" >> .env
+            PREV_IMG="${ECR_REPO_URL}:${PREV_TAG}"
+            docker-compose --env-file .env down || true
+            docker rmi "${CURRENT_IMG}" || true
+            docker-compose --env-file .env pull --ignore-pull-failures
+            docker-compose --env-file .env up -d --force-recreate
+          else
+            echo "All containers are up. Saving ${TAG_TO_DEPLOY} as last-successful-build..."
+            aws ssm put-parameter --name "/idlms/license-api/last-successful-build" --value "${TAG_TO_DEPLOY}" --type String --overwrite
+          fi
+          EOS
+          )
 
-            if [ "$s" = "ecr-reuse" ]; then
-              echo "--- ECR BEFORE cleanup ---"
-              ls -la "$ROOT/$s" || true
-              # kill accidental nested dir or old garbage from earlier attempts
-              rm -rf "$ROOT/$s/infra" || true
-              # keep only the five expected files
-              if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
-                for f in "$ROOT/$s"/*.tf; do
-                  base=$(basename "$f")
-                  case " $ECR_EXPECTED " in *" $base "*) : ;; *) echo "Removing unexpected (ecr-reuse): $base"; rm -f "$f" ;; esac
-                done
-              fi
-              # show contents and verify no 'check' anywhere
-              echo "--- ECR AFTER cleanup ---"
-              ls -la "$ROOT/$s" || true
-              echo "--- grep for check/pre/postcondition (should be empty) ---"
-              (grep -RInE '\bcheck\b|precondition|postcondition' "$ROOT/$s" && echo "::warning::Found check/pre/postcondition in ecr-reuse") || true
-              for f in $ECR_EXPECTED; do echo "----- $f -----"; sed -n '1,200p' "$ROOT/$s/$f" || true; done
-            fi
+          # Fill placeholders
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__ENV__/${ENV}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__ECR__/${ECR_REPO_URL}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__TAG__/${TAG_TO_DEPLOY}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__REGION__/${AWS_REGION}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT/__BUCKET__/${BACKUP_BUCKET}}"
 
-            terraform -chdir="$ROOT/$s" init -upgrade
-            terraform -chdir="$ROOT/$s" validate -no-color
-            terraform -chdir="$ROOT/$s" plan -no-color -out=tfplan
-            terraform -chdir="$ROOT/$s" apply -auto-approve tfplan
-            rm -f "$ROOT/$s/tfplan"
-          done
+          # Send to SSM
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$INSTANCE_ID" \
+            --comment "Deploy containers with rollback logic" \
+            --parameters commands="$(jq -Rn --arg s "$REMOTE_SCRIPT" '$s')" \
+            --timeout-seconds 1200 \
+            --region "$AWS_REGION"
