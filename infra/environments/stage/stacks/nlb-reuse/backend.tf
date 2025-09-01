@@ -3,7 +3,7 @@ terraform {
     bucket = "idlms-terraform-state-backend"
     key    = "IDLMSReplatforming/stage/stacks/nlb-reuse/terraform.tfstate"
     region = "ap-south-1"
-    # dynamodb_table = "idlms-terraform-locks"  # optional
+    # dynamodb_table = "idlms-terraform-locks"
     encrypt = true
   }
 }

@@ -1,4 +1,6 @@
-terraform { required_version = ">= 1.5.0" }
+terraform {
+  required_version = ">= 1.5.0"
+}
 
 data "terraform_remote_state" "nlb" {
   backend = "s3"
