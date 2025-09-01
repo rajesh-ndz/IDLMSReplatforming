@@ -2,12 +2,18 @@ terraform {
   required_version = ">= 1.5.0"
 }
 
+locals {
+  platform_state_bucket  = "idlms-terraform-state-backend"
+  platform_state_region  = "ap-south-1"
+  platform_nlb_state_key = "stage/container/nlb/terraform.tfstate"
+}
+
 data "terraform_remote_state" "nlb" {
   backend = "s3"
   config = {
-    bucket = var.platform_state_bucket
-    key    = var.platform_nlb_state_key
-    region = var.platform_state_region
+    bucket = local.platform_state_bucket
+    key    = local.platform_nlb_state_key
+    region = local.platform_state_region
   }
 }
 
