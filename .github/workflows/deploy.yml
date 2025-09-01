@@ -12,7 +12,7 @@ on:
         required: false
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}   # set in repo Variables (ap-south-1)
+  AWS_REGION: ${{ vars.AWS_REGION }}   # set in repo Variables (e.g., ap-south-1)
 
 concurrency:
   group: deploy-${{ github.ref_name }}-${{ github.event.inputs.ENV || 'stage' }}
@@ -55,15 +55,46 @@ jobs:
           echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
           echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${ACCOUNT_ID}" >> "$GITHUB_ENV"
 
-      # --- APPLY REUSE STACKS (safe: read-only to platform-main state) ---
+      # --- APPLY REUSE STACKS (read-only to platform-main state) ---
       - name: Terraform apply reuse stacks
         run: |
           set -euo pipefail
           ROOT="infra/environments/stage/stacks"
+          EXPECTED_NLB_FILES="backend.tf providers.tf variables.tf main.tf outputs.tf"
+
           for s in network-reuse compute-reuse nlb-reuse ecr-reuse s3-reuse restapi-reuse cloudwatch-reuse ssm-reuse; do
             echo "=== $s ==="
+
+            if [ "$s" = "nlb-reuse" ]; then
+              echo "--- BEFORE cleanup ---"
+              ls -la "$ROOT/$s" || true
+              echo "--- grep for check/pre/postcondition ---"
+              (grep -RInE '\bcheck\b|precondition|postcondition' "$ROOT/$s" && echo "::warning::Found check/pre/postcondition in nlb-reuse") || true
+
+              # Keep only the 5 expected files (avoid stray .tf picked up on runner)
+              if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
+                for f in "$ROOT/$s"/*.tf; do
+                  base=$(basename "$f")
+                  case " $EXPECTED_NLB_FILES " in
+                    *" $base "*) : ;;
+                    *) echo "Removing unexpected: $base"; rm -f "$f" ;;
+                  esac
+                done
+              fi
+
+              echo "--- AFTER cleanup ---"
+              ls -la "$ROOT/$s" || true
+
+              echo "--- Show exact files to run ---"
+              for f in $EXPECTED_NLB_FILES; do
+                echo "----- $f -----"
+                sed -n '1,200p' "$ROOT/$s/$f" || true
+              done
+            fi
+
             terraform -chdir="$ROOT/$s" init -upgrade
-            terraform -chdir="$ROOT/$s" plan -out=tfplan
+            terraform -chdir="$ROOT/$s" validate -no-color
+            terraform -chdir="$ROOT/$s" plan -no-color -out=tfplan
             terraform -chdir="$ROOT/$s" apply -auto-approve tfplan
             rm -f "$ROOT/$s/tfplan"
           done
@@ -150,8 +181,7 @@ jobs:
             exit 1
           fi
 
-          # Build the remote script as a single variable via heredoc.
-          # IMPORTANT: The closing EOS and the closing parenthesis must be indented to stay inside this YAML block.
+          # Build the remote script as a single variable via heredoc (kept inside YAML by indentation)
           REMOTE_SCRIPT=$(cat <<'EOS'
           set -e
           cd /home/ubuntu
