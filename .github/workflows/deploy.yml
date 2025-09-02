@@ -1,4 +1,4 @@
-name: Deploy Multi License API (compose, static creds) – fixed ECR URL
+name: Deploy Multi License API 
 
 on:
   workflow_dispatch:
@@ -55,7 +55,7 @@ jobs:
       - name: Set dynamic TF & backup buckets
         run: |
           echo "TF_BUCKET=${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
-          echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
+          echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-website-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
           echo "Using TF_BUCKET=$TF_BUCKET"
           echo "Using BACKUP_BUCKET=$BACKUP_BUCKET"
 
