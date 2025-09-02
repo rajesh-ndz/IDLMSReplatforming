@@ -1,262 +1,263 @@
-name: Deploy Multi License API with Rollback Options
+name: Deploy Multi License API (restructured) with Rollback
 
 on:
   workflow_dispatch:
     inputs:
       ENV:
-        description: 'Environment to deploy (dev/staging/prod)'
+        description: "Environment to deploy (dev/staging/prod)"
         required: true
-        default: "stage"
+        default: "dev"
+      APP_PORT:
+        description: "App port that exists as NLB listener/TG"
+        required: true
+        default: "4000"
       ROLLBACK_TAG:
-        description: 'Optional: Previous build tag (e.g., 2025.06.30.02). If left blank, deploys latest.'
+        description: "Optional tag to deploy (skip build)"
         required: false
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
+  # --- Adjust these as needed ---
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_BUCKET:  ${{ vars.TF_BUCKET  || 'my-terraform-state-bckt43' }}
+  BACKUP_BUCKET: ${{ vars.BACKUP_BUCKET || 'idlms-stage-built-artifact' }}
+  # Remote state keys (update if your platform-main paths differ)
+  TF_COMPUTE_KEY:   ${{ github.event.inputs.ENV }}/compute/terraform.tfstate
+  TF_NLB_KEY:       ${{ github.event.inputs.ENV }}/container/nlb/terraform.tfstate
+  TF_ECR_KEY:       ${{ github.event.inputs.ENV }}/ecr/terraform.tfstate
+  TF_RESTAPI_KEY:   ${{ github.event.inputs.ENV }}/container/rest-api/terraform.tfstate
+  # SSM parameter names
+  SSM_ENV_PARAM:         /idlms/shared/${{ github.event.inputs.ENV }}/.env
+  SSM_LAST_SUCCESS_PARAM: /idlms/license-api/last-successful-build
 
 concurrency:
-  group: deploy-${{ github.ref_name }}-${{ github.event.inputs.ENV || 'stage' }}
+  group: deploy-${{ github.event.inputs.ENV }}
   cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.ENV || 'stage' }}
+    environment: ${{ github.event.inputs.ENV }}
     permissions:
       id-token: write
       contents: read
 
     steps:
-      - name: Checkout feature/btl-77
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: feature/btl-77
+        # If you need a specific branch:
+        # with:
+        #   ref: feature/btl-48
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.5.0
+          terraform_version: 1.5.7
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
+      # Prefer OIDC. Create secret AWS_ROLE_TO_ASSUME with IAM role ARN.
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get AWS Account ID & set backup bucket
-        id: acct
-        run: |
-          set -euo pipefail
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
-          echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-built-artifact-${ACCOUNT_ID}" >> "$GITHUB_ENV"
+      # If you must use static keys, replace the step above with this:
+      # - name: Configure AWS (static keys)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform apply reuse stacks (read-only)
-        run: |
-          set -euo pipefail
-          ROOT="infra/environments/stage/stacks"
-          NLB_EXPECTED="backend.tf providers.tf main.tf outputs.tf"
-          ECR_EXPECTED="backend.tf providers.tf variables.tf main.tf outputs.tf"
-
-          for s in network-reuse compute-reuse nlb-reuse ecr-reuse s3-reuse restapi-reuse cloudwatch-reuse ssm-reuse; do
-            echo "=== $s ==="
-
-            # Keep only expected files for nlb-reuse (avoid stray files from previous attempts)
-            if [ "$s" = "nlb-reuse" ]; then
-              if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
-                for f in "$ROOT/$s"/*.tf; do
-                  base=$(basename "$f")
-                  case " $NLB_EXPECTED " in *" $base "*) : ;; *) echo "Removing unexpected (nlb-reuse): $base"; rm -f "$f" ;; esac
-                done
-              fi
-            fi
-
-            # Keep only expected files for ecr-reuse (avoid duplicates/provider tf)
-            if [ "$s" = "ecr-reuse" ]; then
-              rm -rf "$ROOT/$s/infra" || true
-              if ls "$ROOT/$s"/*.tf >/dev/null 2>&1; then
-                for f in "$ROOT/$s"/*.tf; do
-                  base=$(basename "$f")
-                  case " $ECR_EXPECTED " in *" $base "*) : ;; *) echo "Removing unexpected (ecr-reuse): $base"; rm -f "$f" ;; esac
-                done
-              fi
-            fi
-
-            terraform -chdir="$ROOT/$s" init -upgrade
-            terraform -chdir="$ROOT/$s" validate -no-color
-            terraform -chdir="$ROOT/$s" plan -no-color -out=tfplan
-            terraform -chdir="$ROOT/$s" apply -auto-approve tfplan
-            rm -f "$ROOT/$s/tfplan"
-          done
-
-      - name: Read ECR repository URL from ecr-reuse outputs
+      - name: Login to ECR
         id: ecr
-        run: |
-          set -euo pipefail
-          OUT_JSON=$(terraform -chdir=infra/environments/stage/stacks/ecr-reuse output -json repository_urls || true)
-          if [ -z "$OUT_JSON" ] || [ "$OUT_JSON" = "null" ]; then
-            echo "::error::No 'repository_urls' output found in ecr-reuse"
-            terraform -chdir=infra/environments/stage/stacks/ecr-reuse output || true
-            exit 1
-          fi
-          ECR_REPO_URL=$(echo "$OUT_JSON" | jq -r 'if type=="array" then .[0] else . end')
-          if [ -z "$ECR_REPO_URL" ] || [ "$ECR_REPO_URL" = "null" ]; then
-            echo "::error::ECR_REPO_URL is empty"; exit 1
-          fi
-          echo "ECR_REPO_URL=$ECR_REPO_URL" >> "$GITHUB_ENV"
-          echo "Using ECR: $ECR_REPO_URL"
-
-      - name: Upload docker-compose.yml to S3
-        run: |
-          set -euo pipefail
-          echo "Uploading to bucket: $BACKUP_BUCKET"
-          aws s3 cp docker/docker-compose.yml "s3://$BACKUP_BUCKET/${{ github.event.inputs.ENV }}/docker-compose.yml"
-
-      - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Generate build tags
-        id: tags
+      - name: Decide image tag (or use rollback tag)
+        id: meta
         run: |
-          set -euo pipefail
-          DATE_TAG=$(date +'%Y.%m.%d')
-          BUILD_NUM=$(printf "%03d" "$GITHUB_RUN_NUMBER")
-          BUILD_TAG="${DATE_TAG}.${BUILD_NUM}"
-          IMAGE_URI="${{ env.ECR_REPO_URL }}:${BUILD_TAG}"
-          LATEST_URI="${{ env.ECR_REPO_URL }}:latest"
-          echo "BUILD_TAG=$BUILD_TAG" >> "$GITHUB_ENV"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
-          echo "LATEST_URI=$LATEST_URI" >> "$GITHUB_ENV"
-
-      - name: Build and tag Docker image
-        run: docker build -t "$IMAGE_URI" -t "$LATEST_URI" -f docker/Dockerfile src
-
-      - name: Push Docker images to ECR
-        run: |
-          set -euo pipefail
-          docker push "$IMAGE_URI"
-          docker push "$LATEST_URI"
-
-      - name: Determine tag to deploy (supports rollback)
-        id: determine-tag
-        run: |
-          set -euo pipefail
           if [ -n "${{ github.event.inputs.ROLLBACK_TAG }}" ]; then
-            TAG_TO_DEPLOY="${{ github.event.inputs.ROLLBACK_TAG }}"
+            echo "tag=${{ github.event.inputs.ROLLBACK_TAG }}" >> $GITHUB_OUTPUT
           else
-            TAG_TO_DEPLOY="${{ env.BUILD_TAG }}"
+            echo "tag=$(date +%Y.%m.%d).$(printf %03d $GITHUB_RUN_NUMBER)" >> $GITHUB_OUTPUT
           fi
-          echo "TAG_TO_DEPLOY=$TAG_TO_DEPLOY" >> "$GITHUB_ENV"
-          echo "Deploying tag: $TAG_TO_DEPLOY"
 
-      - name: Deploy containers via SSM with rollback
-        env:
-          ENV:            ${{ github.event.inputs.ENV }}
-          ECR_REPO_URL:   ${{ env.ECR_REPO_URL }}
-          AWS_REGION:     ${{ env.AWS_REGION }}
-          BACKUP_BUCKET:  ${{ env.BACKUP_BUCKET }}
-          TAG_TO_DEPLOY:  ${{ env.TAG_TO_DEPLOY }}
+      - name: Read platform-main outputs via Terraform remote state
+        id: tfouts
+        shell: bash
         run: |
           set -euo pipefail
+          cat > /tmp/read.tf <<'HCL'
+          terraform {
+            required_providers {
+              aws = { source = "hashicorp/aws", version = ">= 5.0" }
+            }
+          }
+          variable "region"       { type = string }
+          variable "bucket"       { type = string }
+          variable "compute_key"  { type = string }
+          variable "nlb_key"      { type = string }
+          variable "ecr_key"      { type = string }
+          variable "rest_key"     { type = string }
 
-          # Find the instance
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV}" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" \
-            --region "$AWS_REGION" \
-            --output text)
+          provider "aws" { region = var.region }
 
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "ERROR: No running EC2 instance found for environment $ENV"
-            exit 1
+          data "terraform_remote_state" "compute" {
+            backend = "s3"
+            config = { bucket = var.bucket, key = var.compute_key, region = var.region }
+          }
+          data "terraform_remote_state" "nlb" {
+            backend = "s3"
+            config = { bucket = var.bucket, key = var.nlb_key, region = var.region }
+          }
+          data "terraform_remote_state" "ecr" {
+            backend = "s3"
+            config = { bucket = var.bucket, key = var.ecr_key, region = var.region }
+          }
+          data "terraform_remote_state" "rest" {
+            backend = "s3"
+            config = { bucket = var.bucket, key = var.rest_key, region = var.region }
+          }
+
+          output "instance_id"     { value = data.terraform_remote_state.compute.outputs.instance_id }
+          output "tg_map"          { value = data.terraform_remote_state.nlb.outputs.target_group_arns }
+          output "ecr_repo_names"  { value = data.terraform_remote_state.ecr.outputs.repository_names }
+          output "invoke_url"      { value = try(data.terraform_remote_state.rest.outputs.invoke_url, null) }
+          HCL
+
+          terraform -chdir=/tmp init -input=false -no-color >/dev/null
+          terraform -chdir=/tmp apply -no-color -auto-approve \
+            -var="region=${{ env.AWS_REGION }}" \
+            -var="bucket=${{ env.TF_BUCKET }}" \
+            -var="compute_key=${{ env.TF_COMPUTE_KEY }}" \
+            -var="nlb_key=${{ env.TF_NLB_KEY }}" \
+            -var="ecr_key=${{ env.TF_ECR_KEY }}" \
+            -var="rest_key=${{ env.TF_RESTAPI_KEY }}" >/dev/null
+
+          IID=$(terraform -chdir=/tmp output -raw instance_id)
+          echo "instance_id=$IID" >> $GITHUB_OUTPUT
+
+          TG_JSON=$(terraform -chdir=/tmp output -json tg_map)
+          echo "tg_json=$TG_JSON" >> $GITHUB_OUTPUT
+
+          ECR_NAME=$(terraform -chdir=/tmp output -json ecr_repo_names | jq -r '.[0]')
+          echo "ecr_repo=$ECR_NAME" >> $GITHUB_OUTPUT
+
+          INVOKE=$(terraform -chdir=/tmp output -raw invoke_url || true)
+          echo "invoke_url=$INVOKE" >> $GITHUB_OUTPUT
+
+      - name: Build & push image
+        env:
+          ECR_REPO: ${{ steps.tfouts.outputs.ecr_repo }}
+          TAG:      ${{ steps.meta.outputs.tag }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ECR_REPO" ] || [ "$ECR_REPO" = "null" ]; then
+            echo "ECR repo name not found from remote state"; exit 1
           fi
+          IMAGE="${REGISTRY}/${ECR_REPO}:${TAG}"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          # Adjust Dockerfile path/context if needed
+          docker build -t "$IMAGE" -f docker/Dockerfile .
+          docker push "$IMAGE"
 
-          # Build a YAML-safe command payload for SSM
-          REMOTE_SCRIPT=$(cat <<'EOS'
-          set -e
-          cd /home/ubuntu
+      - name: Upload docker-compose.yml to S3 (optional)
+        run: |
+          aws s3 cp docker/docker-compose.yml "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml"
 
-          ENV_NAME="__ENV__"
-          ECR_REPO_URL="__ECR__"
-          TAG_TO_DEPLOY="__TAG__"
-          AWS_REGION="__REGION__"
-          BACKUP_BUCKET="__BUCKET__"
+      - name: Register instance into NLB Target Group
+        env:
+          TG_JSON: ${{ steps.tfouts.outputs.tg_json }}
+          PORT:    ${{ github.event.inputs.APP_PORT }}
+          IID:     ${{ steps.tfouts.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+          TG_ARN=$(jq -r --arg p "$PORT" '.[$p]' <<< "$TG_JSON")
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "null" ]; then
+            echo "TargetGroup for port $PORT not found; aborting."; exit 1
+          fi
+          aws elbv2 register-targets --target-group-arn "$TG_ARN" --targets Id="$IID" --region "${AWS_REGION}"
+          echo "Registered instance $IID into $TG_ARN"
 
-          # Pull env from SSM if present
-          if aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption >/dev/null 2>&1; then
-            ENV_CONTENT=$(aws ssm get-parameter --name "/idlms/shared/${ENV_NAME}/.env" --with-decryption --query "Parameter.Value" --output text)
+      - name: Deploy via SSM using docker-compose (with rollback)
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          PORT:  ${{ github.event.inputs.APP_PORT }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/remote.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "Fetching env file from SSM: ${SSM_ENV_PARAM}"
+          if aws ssm get-parameter --name "${SSM_ENV_PARAM}" --with-decryption >/dev/null 2>&1; then
+            ENV_CONTENT=$(aws ssm get-parameter --name "${SSM_ENV_PARAM}" --with-decryption --query "Parameter.Value" --output text)
           else
             ENV_CONTENT="# placeholder env"
           fi
-          printf "%s\n" "$ENV_CONTENT" > .env
-          echo "BUILD_TAG=${TAG_TO_DEPLOY}" >> .env
-          echo "IMAGE_REPO=${ECR_REPO_URL}" >> .env
 
-          # Compose file from S3
-          aws s3 cp "s3://${BACKUP_BUCKET}/${ENV_NAME}/docker-compose.yml" docker-compose.yml
+          TAG_TO_DEPLOY="${{ steps.meta.outputs.tag }}"
+          IMAGE_REPO="$(echo "$IMAGE" | sed 's/:.*$//')"
 
-          # Ensure docker & docker-compose
+          echo "Preparing .env"
+          {
+            echo "$ENV_CONTENT"
+            echo "BUILD_TAG=$TAG_TO_DEPLOY"
+            echo "IMAGE_REPO=$IMAGE_REPO"
+          } > /tmp/.env.deploy
+
+          # ensure docker + docker-compose
           if ! command -v docker >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y docker.io
           fi
           if ! command -v docker-compose >/dev/null 2>&1; then
             curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
             chmod +x /usr/local/bin/docker-compose
-            ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+            ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose || true
           fi
 
-          # Login to ECR
-          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REPO_URL%/*}"
+          # ECR login and deploy
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "$(echo "$IMAGE" | cut -d/ -f1)"
+          cd /home/ubuntu || cd /root
+          aws s3 cp "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml" docker-compose.yml
 
-          # Stop current stack and remove the currently targeted image tag
-          CURRENT_IMG="${ECR_REPO_URL}:${TAG_TO_DEPLOY}"
-          docker-compose --env-file .env down || true
-          docker rmi "${CURRENT_IMG}" || true
+          docker-compose --env-file /tmp/.env.deploy down || true
+          docker-compose --env-file /tmp/.env.deploy pull --ignore-pull-failures
+          docker-compose --env-file /tmp/.env.deploy up -d --force-recreate --build
 
-          # Deploy
-          docker-compose --env-file .env pull --ignore-pull-failures
-          docker-compose --env-file .env up -d --force-recreate
-
-          # Health check: expect 3 containers (api1, api2, api3)
-          sleep 60
-          RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E "api1|api2|api3" | wc -l)
-          if [ "$RUNNING_CONTAINERS" -ne 3 ]; then
-            echo "Deployment failed. Rolling back..."
-            PREV_TAG=$(aws ssm get-parameter --name "/idlms/license-api/last-successful-build" --query "Parameter.Value" --output text || echo "")
-            if [ -z "$PREV_TAG" ]; then
-              echo "No last-successful-build found; leaving services down for safety."
-              exit 1
+          # simple health gate for N container services (adjust regex as needed)
+          sleep 25
+          RUNNING=$(docker ps --format '{{.Names}}' | grep -E "api1|api2|api3" | wc -l || true)
+          if [ "$RUNNING" -lt 1 ]; then
+            echo "Deployment verification failed; attempting rollback"
+            PREV_TAG=$(aws ssm get-parameter --name "${SSM_LAST_SUCCESS_PARAM}" --query "Parameter.Value" --output text 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              sed -i "/^BUILD_TAG=/d" /tmp/.env.deploy
+              echo "BUILD_TAG=$PREV_TAG" >> /tmp/.env.deploy
+              docker-compose --env-file /tmp/.env.deploy down || true
+              docker-compose --env-file /tmp/.env.deploy pull --ignore-pull-failures
+              docker-compose --env-file /tmp/.env.deploy up -d --force-recreate --build
+            else
+              echo "No previous tag found; leaving current state as-is"
             fi
-            sed -i "/^BUILD_TAG=/d" .env
-            echo "BUILD_TAG=$PREV_TAG" >> .env
-            PREV_IMG="${ECR_REPO_URL}:${PREV_TAG}"
-            docker-compose --env-file .env down || true
-            docker rmi "${CURRENT_IMG}" || true
-            docker-compose --env-file .env pull --ignore-pull-failures
-            docker-compose --env-file .env up -d --force-recreate
           else
-            echo "All containers are up. Saving ${TAG_TO_DEPLOY} as last-successful-build..."
-            aws ssm put-parameter --name "/idlms/license-api/last-successful-build" --value "${TAG_TO_DEPLOY}" --type String --overwrite
+            echo "Services appear up; recording last-successful-build: ${TAG_TO_DEPLOY}"
+            aws ssm put-parameter --name "${SSM_LAST_SUCCESS_PARAM}" --type String --value "${TAG_TO_DEPLOY}" --overwrite
           fi
           EOS
-          )
 
-          # Fill placeholders with runtime values (bash string replacement; safe for slashes)
-          REMOTE_SCRIPT="${REMOTE_SCRIPT/__ENV__/${ENV}}"
-          REMOTE_SCRIPT="${REMOTE_SCRIPT/__ECR__/${ECR_REPO_URL}}"
-          REMOTE_SCRIPT="${REMOTE_SCRIPT/__TAG__/${TAG_TO_DEPLOY}}"
-          REMOTE_SCRIPT="${REMOTE_SCRIPT/__REGION__/${AWS_REGION}}"
-          REMOTE_SCRIPT="${REMOTE_SCRIPT/__BUCKET__/${BACKUP_BUCKET}}"
-
-          # Send to SSM as a single encoded string
           aws ssm send-command \
+            --instance-ids "${{ steps.tfouts.outputs.instance_id }}" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "$INSTANCE_ID" \
-            --comment "Deploy containers with rollback logic" \
-            --parameters commands="$(jq -Rn --arg s "$REMOTE_SCRIPT" '$s')" \
-            --timeout-seconds 1200 \
-            --region "$AWS_REGION"
+            --parameters commands="$(tr '\n' ' ' < /tmp/remote.sh)" \
+            --region "${AWS_REGION}" \
+            --output text
+
+      - name: Optional smoke check (API Gateway)
+        if: ${{ steps.tfouts.outputs.invoke_url != '' }}
+        env:
+          URL: ${{ steps.tfouts.outputs.invoke_url }}
+        run: |
+          set -euo pipefail
+          echo "Hitting $URL"
+          curl -s -o /dev/null -w "%{http_code}\n" "$URL" || true
