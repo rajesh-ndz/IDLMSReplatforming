@@ -1,32 +1,31 @@
-name: Deploy Multi License API (restructured) with Rollback
+name: Deploy Multi License API
 
 on:
   workflow_dispatch:
     inputs:
       ENV:
-        description: "Environment to deploy (dev/staging/prod)"
+        description: "Environment to deploy (dev/stage/prod)"
         required: true
         default: "dev"
-      APP_PORT:
-        description: "App port that exists as NLB listener/TG"
-        required: true
-        default: "4000"
       ROLLBACK_TAG:
-        description: "Optional tag to deploy (skip build)"
+        description: "Optional: tag to deploy instead of building a new one"
         required: false
 
 env:
-  # --- Adjust these as needed ---
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  TF_BUCKET:  ${{ vars.TF_BUCKET  || 'my-terraform-state-bckt43' }}
+  # === Defaults (override via repo Variables if needed) ===
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  TF_BUCKET:  ${{ vars.TF_BUCKET  || 'idlms-terraform-state-backend' }}   # platform-main state bucket
   BACKUP_BUCKET: ${{ vars.BACKUP_BUCKET || 'idlms-stage-built-artifact' }}
-  # Remote state keys (update if your platform-main paths differ)
+  APP_PORT: "4000"
+
+  # Remote state keys (adjust if your platform-main uses different paths)
   TF_COMPUTE_KEY:   ${{ github.event.inputs.ENV }}/compute/terraform.tfstate
   TF_NLB_KEY:       ${{ github.event.inputs.ENV }}/container/nlb/terraform.tfstate
   TF_ECR_KEY:       ${{ github.event.inputs.ENV }}/ecr/terraform.tfstate
   TF_RESTAPI_KEY:   ${{ github.event.inputs.ENV }}/container/rest-api/terraform.tfstate
-  # SSM parameter names
-  SSM_ENV_PARAM:         /idlms/shared/${{ github.event.inputs.ENV }}/.env
+
+  # SSM parameters
+  SSM_ENV_PARAM:          /idlms/shared/${{ github.event.inputs.ENV }}/.env
   SSM_LAST_SUCCESS_PARAM: /idlms/license-api/last-successful-build
 
 concurrency:
@@ -38,41 +37,35 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.ENV }}
     permissions:
-      id-token: write
       contents: read
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        # If you need a specific branch:
-        # with:
-        #   ref: feature/btl-48
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.7
 
-      # Prefer OIDC. Create secret AWS_ROLE_TO_ASSUME with IAM role ARN.
-      - name: Configure AWS (OIDC)
+      # === Static key auth (Option B) ===
+      - name: Configure AWS (static keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # If using temporary creds, also include:
+          # aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # If you must use static keys, replace the step above with this:
-      # - name: Configure AWS (static keys)
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #     aws-region: ${{ env.AWS_REGION }}
+      - name: Who am I?
+        run: aws sts get-caller-identity
 
       - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Decide image tag (or use rollback tag)
+      - name: Decide image tag
         id: meta
         run: |
           if [ -n "${{ github.event.inputs.ROLLBACK_TAG }}" ]; then
@@ -157,7 +150,7 @@ jobs:
           fi
           IMAGE="${REGISTRY}/${ECR_REPO}:${TAG}"
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-          # Adjust Dockerfile path/context if needed
+          # Adjust Dockerfile/context if needed (e.g., "-f docker/Dockerfile src")
           docker build -t "$IMAGE" -f docker/Dockerfile .
           docker push "$IMAGE"
 
@@ -165,10 +158,10 @@ jobs:
         run: |
           aws s3 cp docker/docker-compose.yml "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml"
 
-      - name: Register instance into NLB Target Group
+      - name: Register instance into NLB Target Group (APP_PORT=4000)
         env:
           TG_JSON: ${{ steps.tfouts.outputs.tg_json }}
-          PORT:    ${{ github.event.inputs.APP_PORT }}
+          PORT:    ${{ env.APP_PORT }}
           IID:     ${{ steps.tfouts.outputs.instance_id }}
         run: |
           set -euo pipefail
@@ -182,7 +175,6 @@ jobs:
       - name: Deploy via SSM using docker-compose (with rollback)
         env:
           IMAGE: ${{ env.IMAGE }}
-          PORT:  ${{ github.event.inputs.APP_PORT }}
         run: |
           set -euo pipefail
           cat > /tmp/remote.sh <<'EOS'
@@ -225,9 +217,9 @@ jobs:
           docker-compose --env-file /tmp/.env.deploy pull --ignore-pull-failures
           docker-compose --env-file /tmp/.env.deploy up -d --force-recreate --build
 
-          # simple health gate for N container services (adjust regex as needed)
+          # simple health gate (adjust regex if you manage multiple services)
           sleep 25
-          RUNNING=$(docker ps --format '{{.Names}}' | grep -E "api1|api2|api3" | wc -l || true)
+          RUNNING=$(docker ps --format '{{.Names}}' | wc -l || true)
           if [ "$RUNNING" -lt 1 ]; then
             echo "Deployment verification failed; attempting rollback"
             PREV_TAG=$(aws ssm get-parameter --name "${SSM_LAST_SUCCESS_PARAM}" --query "Parameter.Value" --output text 2>/dev/null || echo "")
