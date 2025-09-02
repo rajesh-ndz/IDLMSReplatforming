@@ -1,4 +1,4 @@
-name: Deploy Multi License API (compose, static creds) with Rollback
+name: Deploy Multi License API with Rollback Options (fixed ECR URL)
 
 on:
   workflow_dispatch:
@@ -8,13 +8,15 @@ on:
         required: true
         default: "stage"
       ROLLBACK_TAG:
-        description: "Optional: Previous tag to deploy (e.g., 2025.06.30.02). If blank, deploys new build."
+        description: "Optional: previous tag to deploy (e.g., 2025.06.30.02). If blank, deploys new build."
         required: false
 
 env:
-  # Region from repo Variables if set, else default
+  # Use repo Variables if set; fallback to ap-south-1 (your infra region)
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
   TF_REGION:  ${{ vars.AWS_REGION || 'ap-south-1' }}
+  # Optional override if you want to hardcode the ECR repo name (otherwise defaults to ${ENV}-idlms-api)
+  ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
 
 jobs:
   deploy:
@@ -58,9 +60,7 @@ jobs:
           echo "Using TF_BUCKET=$TF_BUCKET"
           echo "Using BACKUP_BUCKET=$BACKUP_BUCKET"
 
-      # ─────────────────────────────────────────────────
-      # Optional infra applies — SKIP if folder missing
-      # ─────────────────────────────────────────────────
+      # ───────────── Infra applies — SKIP if folder missing ─────────────
       - name: Terraform Apply VPC (skip if folder missing)
         run: |
           if [ ! -d infra/vpc ]; then echo "infra/vpc not found; skipping"; exit 0; fi
@@ -105,7 +105,7 @@ jobs:
       - name: Terraform Apply ECR (capture repo URL) (skip if folder missing)
         id: ecr
         run: |
-          if [ ! -d infra/ecr ]; then echo "infra/ecr not found; skipping (will rely on existing repo)"; exit 0; fi
+          if [ ! -d infra/ecr ]; then echo "infra/ecr not found; skipping (will derive repo URL)"; exit 0; fi
           cd infra/ecr
           terraform init \
             -backend-config="bucket=${TF_BUCKET}" \
@@ -143,23 +143,18 @@ jobs:
           echo "SSM_ENV_PARAM=$SSM_ENV_PARAM" >> $GITHUB_ENV
           echo "Published env to SSM: $SSM_ENV_PARAM"
 
-      - name: Terraform Apply S3 (skip if folder missing) + Upload compose
+      - name: Terraform Apply S3 (skip if folder missing)
         id: s3_apply
         run: |
-          if [ -d infra/s3 ]; then
-            cd infra/s3
-            terraform init \
-              -backend-config="bucket=${TF_BUCKET}" \
-              -backend-config="key=${{ github.event.inputs.ENV }}/s3/terraform.tfstate" \
-              -backend-config="region=${TF_REGION}"
-            terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-            cd ../..
-          fi
-          echo "Will upload compose later after rendering ECR image path"
+          if [ ! -d infra/s3 ]; then echo "infra/s3 not found; skipping tf apply"; exit 0; fi
+          cd infra/s3
+          terraform init \
+            -backend-config="bucket=${TF_BUCKET}" \
+            -backend-config="key=${{ github.event.inputs.ENV }}/s3/terraform.tfstate" \
+            -backend-config="region=${TF_REGION}"
+          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
 
-      # ─────────────────────────────────────────────────
-      # Build & push images (compose + guaranteed fallback)
-      # ─────────────────────────────────────────────────
+      # ───────────── Build & push images (compose + fallback) ─────────────
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -173,18 +168,30 @@ jobs:
           echo "BUILD_TAG=$BUILD_TAG" >> $GITHUB_ENV
           echo "Build tag: $BUILD_TAG"
 
-      - name: Ensure ECR_REPO_URL (from Terraform or env)
+      - name: Determine ECR repo URL (robust)
         run: |
+          set -euo pipefail
           if [ -z "${ECR_REPO_URL:-}" ] || [ "${ECR_REPO_URL}" = "null" ]; then
-            # If not set by Terraform, try reading from repo Variables
+            # prefer repo variable ECR_REPO_URL if set
             if [ -n "${{ vars.ECR_REPO_URL || '' }}" ]; then
               echo "ECR_REPO_URL=${{ vars.ECR_REPO_URL }}" >> $GITHUB_ENV
+              echo "Using ECR_REPO_URL from repo variable."
             else
-              echo "ERROR: ECR_REPO_URL not found. Provide it via infra/ecr outputs or repo variable ECR_REPO_URL."
-              exit 1
+              # derive from ENV and account/region
+              REPO_NAME="${ECR_REPO_NAME:-${{ github.event.inputs.ENV }}-idlms-api}"
+              ACCOUNT_ID="${{ steps.aws-account.outputs.account_id }}"
+              DERIVED="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}"
+              # validate it exists
+              if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "${AWS_REGION}" >/dev/null 2>&1; then
+                echo "::error::ECR repository '$REPO_NAME' does not exist in ${AWS_REGION}. Create it via infra/ecr or set repo variable ECR_REPO_URL."
+                exit 1
+              fi
+              echo "ECR_REPO_URL=$DERIVED" >> $GITHUB_ENV
+              echo "Derived ECR_REPO_URL=$DERIVED"
             fi
+          else
+            echo "Using ECR_REPO_URL=${ECR_REPO_URL} (from Terraform)"
           fi
-          echo "Using ECR_REPO_URL=${ECR_REPO_URL}"
 
       - name: Build & push via docker compose if images are defined
         env:
@@ -195,12 +202,12 @@ jobs:
           if [ -f docker/docker-compose.yml ] && grep -qE '^\s*image:' docker/docker-compose.yml; then
             echo "Found image fields in compose; building & pushing with compose"
             export IMAGE_REPO BUILD_TAG
-            # Optionally sed the compose to interpolate ${IMAGE_REPO}:${BUILD_TAG} for every service
-            sed -E "s|^(\\s*image:\\s*).+:\\$\\{BUILD_TAG\\}|\\1${IMAGE_REPO}:\${BUILD_TAG}|g" docker/docker-compose.yml > docker/docker-compose.rendered.yml
+            # Render compose to pin image to ECR_REPO_URL:BUILD_TAG
+            sed -E "s|(image:\\s*)([^:]+)(:)?(\\$\\{BUILD_TAG\\})?|\\1${IMAGE_REPO}:\\${BUILD_TAG}|g" docker/docker-compose.yml > docker/docker-compose.rendered.yml
             docker compose -f docker/docker-compose.rendered.yml build
             docker compose -f docker/docker-compose.rendered.yml push || true
           else
-            echo "No 'image:' fields found in compose; will rely on single-image build below."
+            echo "No 'image:' in compose; will rely on single-image build below."
           fi
 
       - name: Canonical single-image build & push (fallback/guarantee)
@@ -213,6 +220,7 @@ jobs:
           LATEST_URI="${ECR_REPO_URL}:latest"
           echo "IMAGE_URI=$IMAGE_URI"   >> $GITHUB_ENV
           echo "LATEST_URI=$LATEST_URI" >> $GITHUB_ENV
+          # Adjust Dockerfile/context if your repo differs
           docker build -t "$IMAGE_URI" -t "$LATEST_URI" -f docker/Dockerfile src
           docker push "$IMAGE_URI"
           docker push "$LATEST_URI"
@@ -227,14 +235,11 @@ jobs:
 
       - name: Upload docker-compose.yml to S3 (rendered with correct ECR repo)
         run: |
-          # Use rendered compose if we created it, else upload the original
           SRC="docker/docker-compose.rendered.yml"
           if [ ! -f "$SRC" ]; then SRC="docker/docker-compose.yml"; fi
           aws s3 cp "$SRC" "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml"
 
-      # ─────────────────────────────────────────────────
-      # Deploy on EC2 via SSM (docker-compose + rollback)
-      # ─────────────────────────────────────────────────
+      # ───────────── Deploy on EC2 via SSM (compose + rollback) ─────────────
       - name: Deploy containers with rollback logic via SSM
         run: |
           TAG_TO_DEPLOY="${{ env.TAG_TO_DEPLOY }}"
