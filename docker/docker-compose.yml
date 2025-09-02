@@ -1,35 +1,28 @@
 version: "3.8"
-
 services:
   api1:
-    image: 592776312448.dkr.ecr.ap-south-1.amazonaws.com/stage-idlms-api:${BUILD_TAG}
+    image: ${IMAGE_REPO}:${BUILD_TAG}
     container_name: api1
     restart: always
-    env_file:
-      - .env.api1
-    ports:
-      - "4000:4000"
+    env_file: [.env.api1]
+    ports: ["4000:4000"]
     working_dir: /app
     command: node dist/main.js
 
   api2:
-    image: 592776312448.dkr.ecr.ap-south-1.amazonaws.com/stage-idlms-api:${BUILD_TAG}
+    image: ${IMAGE_REPO}:${BUILD_TAG}
     container_name: api2
     restart: always
-    env_file:
-      - .env.api2
-    ports:
-      - "4001:4001"
+    env_file: [.env.api2]
+    ports: ["4001:4001"]
     working_dir: /app
     command: node dist/main.js
 
   api3:
-    image: 592776312448.dkr.ecr.ap-south-1.amazonaws.com/stage-idlms-api:${BUILD_TAG}
+    image: ${IMAGE_REPO}:${BUILD_TAG}
     container_name: api3
     restart: always
-    env_file:
-      - .env.api3
-    ports:
-      - "4002:4002"
+    env_file: [.env.api3]
+    ports: ["4002:4002"]
     working_dir: /app
     command: node dist/main.js
