@@ -12,11 +12,11 @@ on:
         required: false
 
 env:
-  # Set this to the region where your EC2/ECR actually live (recommend ap-south-1 for your setup)
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
   TF_REGION:  ${{ vars.AWS_REGION || 'ap-south-1' }}
-  # Optional: override repo name if not ${ENV}-idlms-api
   ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
+  # NEW: default instance name pattern is "<env>-idlms-app" (you can override via repo variable)
+  EC2_INSTANCE_NAME_PATTERN: ${{ vars.EC2_INSTANCE_NAME_PATTERN || format('{0}-idlms-app', github.event.inputs.ENV) }}
 
 jobs:
   deploy:
@@ -55,6 +55,7 @@ jobs:
       - name: Set dynamic TF & backup buckets
         run: |
           echo "TF_BUCKET=${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
+          # NOTE: include 'website-' to match your actual bucket name
           echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-website-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
           echo "Using TF_BUCKET=$TF_BUCKET"
           echo "Using BACKUP_BUCKET=$BACKUP_BUCKET"
@@ -167,49 +168,36 @@ jobs:
       - name: Determine ECR repo URL (robust; tries other region if needed)
         run: |
           set -euo pipefail
-          # 1) If Terraform already set it, keep it
           if [ -n "${ECR_REPO_URL:-}" ] && [ "${ECR_REPO_URL}" != "null" ]; then
             echo "Keeping ECR_REPO_URL from Terraform: ${ECR_REPO_URL}"
-            # infer ECR_REGION from URL
-            ECR_REGION="$(echo "$ECR_REPO_URL" | awk -F. '{print $(NF-2) "-" $(NF-1)}' | sed 's/^dkr-ecr-//; s/amazonaws//; s/.$//')"
+            ECR_REGION="$(echo "$ECR_REPO_URL" | awk -F. '{print $(NF-2)}')"
             [ -z "$ECR_REGION" ] && ECR_REGION="${AWS_REGION}"
             echo "ECR_REGION=${ECR_REGION}" >> $GITHUB_ENV
             exit 0
           fi
-
-          # 2) If repo variable exists, use it
           if [ -n "${{ vars.ECR_REPO_URL || '' }}" ]; then
             echo "ECR_REPO_URL=${{ vars.ECR_REPO_URL }}" >> $GITHUB_ENV
-            # derive region from url
             URL="${{ vars.ECR_REPO_URL }}"
             ECR_REGION="$(echo "$URL" | awk -F. '{print $(NF-2)}')"
             [ -z "$ECR_REGION" ] && ECR_REGION="${AWS_REGION}"
             echo "ECR_REGION=${ECR_REGION}" >> $GITHUB_ENV
             exit 0
           fi
-
-          # 3) Derive from account+region+repo name, and if not found in $AWS_REGION, try the other common region
           ACCOUNT_ID="${{ steps.aws-account.outputs.account_id }}"
           REPO_NAME="${ECR_REPO_NAME:-${{ github.event.inputs.ENV }}-idlms-api}"
-
-          # First try the declared AWS_REGION
           ECR_REGION="${AWS_REGION}"
           if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$ECR_REGION" >/dev/null 2>&1; then
-            # Try the other region commonly used in your logs
             ALT_REGIONS="ap-south-1 ap-southeast-1"
             for R in $ALT_REGIONS; do
               if [ "$R" != "$ECR_REGION" ] && aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$R" >/dev/null 2>&1; then
-                ECR_REGION="$R"
-                break
+                ECR_REGION="$R"; break
               fi
             done
           fi
-
           if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$ECR_REGION" >/dev/null 2>&1; then
-            echo "::error::ECR repository '$REPO_NAME' not found in $AWS_REGION or fallback regions. Create it (via infra/ecr or console) or set repo variable ECR_REPO_URL."
+            echo "::error::ECR repository '$REPO_NAME' not found. Create it or set repo variable ECR_REPO_URL."
             exit 1
           fi
-
           ECR_REPO_URL="${ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com/${REPO_NAME}"
           echo "ECR_REPO_URL=$ECR_REPO_URL" >> $GITHUB_ENV
           echo "ECR_REGION=$ECR_REGION"       >> $GITHUB_ENV
@@ -224,8 +212,7 @@ jobs:
           if [ -f docker/docker-compose.yml ] && grep -qE '^\s*image:' docker/docker-compose.yml; then
             echo "Found image fields in compose; building & pushing with compose"
             export IMAGE_REPO BUILD_TAG
-            # Render compose to pin image to ECR_REPO_URL:BUILD_TAG
-            sed -E "s|(image:\\s*)([^:]+)(:)?(\\$\\{BUILD_TAG\\})?|\\1${IMAGE_REPO}:\\${BUILD_TAG}|g" docker/docker-compose.yml > docker/docker-compose.rendered.yml
+            sed -E "s|(image:\s*)([^:]+)(:)?(\$\{BUILD_TAG\})?|\\1${IMAGE_REPO}:\${BUILD_TAG}|g" docker/docker-compose.yml > docker/docker-compose.rendered.yml
             docker compose -f docker/docker-compose.rendered.yml build
             docker compose -f docker/docker-compose.rendered.yml push || true
           else
@@ -243,7 +230,6 @@ jobs:
           LATEST_URI="${ECR_REPO_URL}:latest"
           echo "IMAGE_URI=$IMAGE_URI"   >> $GITHUB_ENV
           echo "LATEST_URI=$LATEST_URI" >> $GITHUB_ENV
-          # login and push in the ECR's region
           aws ecr get-login-password --region "${ECR_REGION}" | docker login --username AWS --password-stdin "$(echo "$ECR_REPO_URL" | cut -d/ -f1)"
           docker build -t "$IMAGE_URI" -t "$LATEST_URI" -f docker/Dockerfile src
           docker push "$IMAGE_URI"
@@ -263,6 +249,23 @@ jobs:
           if [ ! -f "$SRC" ]; then SRC="docker/docker-compose.yml"; fi
           aws s3 cp "$SRC" "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml"
 
+      # NEW: resolve INSTANCE_ID by Name tag (stage-idlms-app pattern)
+      - name: Resolve EC2 INSTANCE_ID by Name tag
+        run: |
+          set -euo pipefail
+          NAME="${EC2_INSTANCE_NAME_PATTERN}"
+          IID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${NAME}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text \
+            --region "${AWS_REGION}" | awk '{print $1}')
+          if [ -z "$IID" ] || [ "$IID" = "None" ]; then
+            echo "::error::No running EC2 instance found matching Name='${NAME}' in ${AWS_REGION}"
+            exit 1
+          fi
+          echo "INSTANCE_ID=$IID" >> $GITHUB_ENV
+          echo "Resolved INSTANCE_ID=$IID"
+
       # ───────── Deploy on EC2 via SSM (compose + rollback) ─────────
       - name: Deploy containers with rollback logic via SSM
         run: |
@@ -272,16 +275,10 @@ jobs:
           ECR_REGION="${{ env.ECR_REGION || env.AWS_REGION }}"
           AWS_REGION="${{ env.AWS_REGION }}"
           BACKUP_BUCKET="${{ env.BACKUP_BUCKET }}"
-
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV}" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" \
-            --region "$AWS_REGION" \
-            --output text)
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
 
           if [ -z "$INSTANCE_ID" ]; then
-            echo "ERROR: No running EC2 instance found for environment $ENV"
-            exit 1
+            echo "ERROR: INSTANCE_ID is empty"; exit 1
           fi
 
           aws ssm send-command \
@@ -295,6 +292,12 @@ jobs:
               "echo \"$ENV_CONTENT\" > .env",
               "echo \"BUILD_TAG='"$TAG_TO_DEPLOY"'\" >> .env",
               "echo \"IMAGE_REPO='"$ECR_REPO_URL"'\" >> .env",
+              "grep -q '^PORT='  .env || echo 'PORT=4000' >> .env",
+              "grep -q '^PORT1=' .env || echo 'PORT1=4001' >> .env",
+              "grep -q '^PORT2=' .env || echo 'PORT2=4002' >> .env",
+              "cp .env .env.api1 && sed -i \"s/^PORT=.*/PORT=4000/\" .env.api1",
+              "cp .env .env.api2 && sed -i \"s/^PORT=.*/PORT=4001/\" .env.api2",
+              "cp .env .env.api3 && sed -i \"s/^PORT=.*/PORT=4002/\" .env.api3",
               "aws s3 cp s3://'"$BACKUP_BUCKET"'/'"$ENV"'/docker-compose.yml docker-compose.yml",
               "if ! command -v docker &> /dev/null; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
               "if ! command -v docker-compose &> /dev/null; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
@@ -304,21 +307,24 @@ jobs:
               "docker-compose --env-file .env pull --ignore-pull-failures",
               "docker-compose --env-file .env up -d --force-recreate --build",
               "sleep 60",
-              "RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | wc -l) && \
-              if [ \\\"$RUNNING_CONTAINERS\\\" -lt 1 ]; then \
-                echo \\\"Deployment failed. Rolling back...\\\"; \
-                PREV_TAG=$(aws ssm get-parameter --name \\\"/idlms/license-api/last-successful-build\\\" --query \\\"Parameter.Value\\\" --output text); \
-                echo \\\"Rolling back to tag: $PREV_TAG\\\"; \
-                sed -i \\\"/BUILD_TAG=/d\\\" .env; \
-                echo \\\"BUILD_TAG=$PREV_TAG\\\" >> .env; \
-                docker-compose --env-file .env down || true; \
-                docker rmi ${IMAGE_REPO}:${BUILD_TAG} || true; \
-                docker-compose --env-file .env pull --ignore-pull-failures; \
-                docker-compose --env-file .env up -d --force-recreate --build; \
-              else \
-                echo \\\"All containers are up. Saving $TAG_TO_DEPLOY as last-successful-build...\\\"; \
-                aws ssm put-parameter --name \\\"/idlms/license-api/last-successful-build\\\" --value \\\"$TAG_TO_DEPLOY\\\" --type String --overwrite; \
-              fi"
+              "RUNNING=$(docker ps --format '{{.Names}}' | wc -l) && \
+               if [ \\\"$RUNNING\\\" -lt 1 ]; then \
+                 echo \\\"Deployment failed. Rolling back...\\\"; \
+                 PREV_TAG=$(aws ssm get-parameter --name \\\"/idlms/license-api/last-successful-build\\\" --query \\\"Parameter.Value\\\" --output text 2>/dev/null || echo \\\"\\\"); \
+                 if [ -n \\\"$PREV_TAG\\\" ]; then \
+                   sed -i \\\"/BUILD_TAG=/d\\\" .env; \
+                   echo \\\"BUILD_TAG=$PREV_TAG\\\" >> .env; \
+                   docker-compose --env-file .env down || true; \
+                   docker rmi ${IMAGE_REPO}:${BUILD_TAG} || true; \
+                   docker-compose --env-file .env pull --ignore-pull-failures; \
+                   docker-compose --env-file .env up -d --force-recreate --build; \
+                 else \
+                   echo \\\"No previous tag recorded; leaving current state\\\"; \
+                 fi; \
+               else \
+                 echo \\\"All containers are up. Saving $TAG_TO_DEPLOY as last-successful-build...\\\"; \
+                 aws ssm put-parameter --name \\\"/idlms/license-api/last-successful-build\\\" --value \\\"$TAG_TO_DEPLOY\\\" --type String --overwrite; \
+               fi"
             ]' \
             --timeout-seconds 900 \
             --region "$AWS_REGION" \
