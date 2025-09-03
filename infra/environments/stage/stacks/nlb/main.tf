@@ -1,4 +1,6 @@
 module "nlb_state" {
+  count  = var.use_remote_state ? 1 : 0
+
   source = "../../../../platform/remote/nlb_state"
   bucket = "idlms-terraform-state-backend"
   key    = "stage/nlb/terraform.tfstate"
