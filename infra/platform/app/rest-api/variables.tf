@@ -1,10 +1,5 @@
-variable "region" {
-  type = string
-}
-
-variable "env_name" {
-  type = string
-}
+variable "region" { type = string }
+variable "env_name" { type = string }
 
 variable "enabled" {
   type    = bool
@@ -26,13 +21,8 @@ variable "description" {
   default = "IDLMS REST API (reusing NLB)"
 }
 
-variable "nlb_ssm_prefix" {
-  type = string
-}
-
-variable "port" {
-  type = number
-}
+variable "nlb_ssm_prefix" { type = string }
+variable "port"           { type = number }
 
 variable "endpoint_type" {
   type    = string
@@ -42,4 +32,9 @@ variable "endpoint_type" {
 variable "access_log_retention_days" {
   type    = number
   default = 14
+}
+
+variable "root_path" {
+  type    = string
+  default = ""
 }

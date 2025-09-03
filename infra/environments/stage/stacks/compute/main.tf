@@ -15,7 +15,7 @@ module "publish" {
     security_group_id   = module.compute_state.security_group_id
   }
 }
-output "instance_id" { value = module.compute_state.instance_id }
+output "instance_id"         { value = module.compute_state.instance_id }
 output "instance_private_ip" { value = module.compute_state.instance_private_ip }
-output "security_group_id" { value = module.compute_state.security_group_id }
-output "published" { value = try(module.publish[0].published, []) }
+output "security_group_id"   { value = module.compute_state.security_group_id }
+output "published"           { value = try(module.publish[0].published, []) }

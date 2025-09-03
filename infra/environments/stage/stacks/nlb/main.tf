@@ -17,9 +17,9 @@ module "publish" {
     target_group_arns = jsonencode(module.nlb_state.target_group_arns)
   }
 }
-output "lb_arn" { value = module.nlb_state.lb_arn }
-output "lb_dns_name" { value = module.nlb_state.lb_dns_name }
-output "lb_zone_id" { value = module.nlb_state.lb_zone_id }
-output "listener_arns" { value = module.nlb_state.listener_arns }
+output "lb_arn"            { value = module.nlb_state.lb_arn }
+output "lb_dns_name"       { value = module.nlb_state.lb_dns_name }
+output "lb_zone_id"        { value = module.nlb_state.lb_zone_id }
+output "listener_arns"     { value = module.nlb_state.listener_arns }
 output "target_group_arns" { value = module.nlb_state.target_group_arns }
-output "published" { value = try(module.publish[0].published, []) }
+output "published"         { value = try(module.publish[0].published, []) }

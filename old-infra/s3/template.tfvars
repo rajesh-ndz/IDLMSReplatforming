@@ -1,5 +1,6 @@
-# --- General Environment Settings ---
-environment        =  {{ env }}           # The environment name (e.g., "stage")
-
-# --- S3 Bucket Settings ---
-enable_versioning  =  {{ true | false }}           # Boolean to enable or disable versioning (e.g., true or false)
+# Example values
+environment       = "stage"
+region            = "ap-south-1"
+bucket_name       = "idlms-stage-example-bucket-123456"
+enable_versioning = true
+enable_encryption = true

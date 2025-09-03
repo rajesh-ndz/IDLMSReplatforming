@@ -1,1 +1,1 @@
-provider "aws" {}
+# Provider config inherited from root.

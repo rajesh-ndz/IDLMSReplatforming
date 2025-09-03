@@ -15,7 +15,7 @@ module "publish" {
     private_subnet_ids = jsonencode(module.network_state.private_subnet_ids)
   }
 }
-output "vpc_id" { value = module.network_state.vpc_id }
-output "public_subnet_ids" { value = module.network_state.public_subnet_ids }
+output "vpc_id"             { value = module.network_state.vpc_id }
+output "public_subnet_ids"  { value = module.network_state.public_subnet_ids }
 output "private_subnet_ids" { value = module.network_state.private_subnet_ids }
-output "published" { value = try(module.publish[0].published, []) }
+output "published"          { value = try(module.publish[0].published, []) }

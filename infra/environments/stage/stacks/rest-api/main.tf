@@ -7,5 +7,5 @@ module "api" {
   port           = var.port
 }
 output "rest_api_id" { value = module.api.rest_api_id }
-output "invoke_url" { value = module.api.invoke_url }
-output "stage_name" { value = module.api.stage_name }
+output "invoke_url"  { value = module.api.invoke_url }
+output "stage_name"  { value = module.api.stage_name }

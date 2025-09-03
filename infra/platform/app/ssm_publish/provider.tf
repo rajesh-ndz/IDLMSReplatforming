@@ -1,1 +1,1 @@
-provider "aws" { region = var.region }
+# Provider config inherited from root.

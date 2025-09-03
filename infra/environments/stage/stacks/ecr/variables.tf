@@ -4,4 +4,9 @@ variable "publish_to_ssm" {
   type    = bool
   default = true
 }
-variable "ssm_prefix"     { type = string default = "/idlms/ecr/stage" }
+
+variable "ssm_prefix" {
+  type    = string
+  default = "/idlms/ecr/stage"
+}
+
