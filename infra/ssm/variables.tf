@@ -1,24 +1,33 @@
-# Which environment are we writing under (dev|stage|prod)
 variable "env" {
-  description = "Environment name"
+  description = "Environment name (e.g., dev|stage|prod)"
   type        = string
 }
 
-# CI passes the .env content base64-encoded; we support both var names for compatibility
-variable "app_env_content_b64" {
-  description = "Base64 of .env content for /idlms/shared/<env>/.env"
+# OPTIONAL overrides; usually you don't need to set these
+variable "app_env_param_name" {
+  description = "Full SSM path for the app .env parameter"
   type        = string
   default     = null
 }
+variable "last_success_param_name" {
+  description = "Full SSM path for last successful build tag"
+  type        = string
+  default     = null
+}
+
+# Required by resource schema but ignored for drift; used only if you 'apply'
 variable "app_env_content" {
-  description = "Alias (also base64) for compatibility with older workflow"
+  description = "Placeholder content for the .env SecureString (ignored on import)"
   type        = string
-  default     = null
+  default     = "# placeholder"
+}
+variable "last_success_value" {
+  description = "Placeholder for last-successful-build param (ignored on import)"
+  type        = string
+  default     = "placeholder"
 }
 
-# Let Terraform create & manage the "last successful build" key too
-variable "manage_last_success_param" {
-  description = "If true, manage /idlms/license-api/last-successful-build as TF resource"
-  type        = bool
-  default     = true
+locals {
+  app_env_param_name      = coalesce(var.app_env_param_name, "/idlms/shared/${var.env}/.env")
+  last_success_param_name = coalesce(var.last_success_param_name, "/idlms/license-api/last-successful-build")
 }
