@@ -16,6 +16,6 @@ module "publish" {
   }
 }
 output "repository_names" { value = module.ecr_state.repository_names }
-output "repository_urls"  { value = module.ecr_state.repository_urls }
-output "repository_arns"  { value = module.ecr_state.repository_arns }
-output "published"        { value = try(module.publish[0].published, []) }
+output "repository_urls" { value = module.ecr_state.repository_urls }
+output "repository_arns" { value = module.ecr_state.repository_arns }
+output "published" { value = try(module.publish[0].published, []) }

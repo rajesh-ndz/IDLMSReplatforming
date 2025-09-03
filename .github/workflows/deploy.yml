@@ -69,76 +69,96 @@ jobs:
           echo "BACKEND_REGION=$BKT_REGION" >> $GITHUB_ENV
           echo "Terraform state bucket region: $BKT_REGION"
 
-
       - name: Install jq
         run: sudo apt-get update -y && sudo apt-get install -y jq
 
-      # ───────── Optional infra applies — SKIP if folder missing ─────────
-      - name: Terraform Apply VPC (skip if folder missing)
-        run: |
-          if [ ! -d infra/vpc ]; then echo "infra/vpc not found; skipping"; exit 0; fi
-          cd infra/vpc
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" \
-            -backend-config="region=${BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+      - name: Export ENV for bash
+        run: echo "ENV=${{ github.event.inputs.ENV || 'stage' }}" >> $GITHUB_ENV
 
-      - name: Terraform Apply NLB (skip if folder missing)
-        run: |
-          if [ ! -d infra/nlb ]; then echo "infra/nlb not found; skipping"; exit 0; fi
-          cd infra/nlb
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/nlb/terraform.tfstate" \
-            -backend-config="region=${BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-
-      - name: Terraform Apply API (rest-api)
+      # ───────── Terraform (stacks layout) ─────────
+      - name: Terraform Apply Network (skip if folder missing)
+        shell: bash
         run: |
           set -euo pipefail
-          cd infra/rest-api
-              
+          DIR="infra/environments/${ENV}/stacks/network"
+          if [ ! -d "$DIR" ]; then echo "$DIR not found; skipping"; exit 0; fi
+          cd "$DIR"
           terraform init -reconfigure -upgrade \
             -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/rest-api/terraform.tfstate" \
+            -backend-config="key=${ENV}/network/terraform.tfstate" \
             -backend-config="region=${BACKEND_REGION}"
-              
-          terraform plan -input=false \
-            -var-file="${{ github.event.inputs.ENV }}.tfvars" \
-            -out=plan.out
-              
-          # Apply if there are resource OR output changes
+          ARGS=()
+          [ -f "${ENV}.tfvars" ] && ARGS+=(-var-file="${ENV}.tfvars")
+          terraform apply -auto-approve "${ARGS[@]}"
+
+      - name: Terraform Apply NLB (skip if folder missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="infra/environments/${ENV}/stacks/nlb"
+          if [ ! -d "$DIR" ]; then echo "$DIR not found; skipping"; exit 0; fi
+          cd "$DIR"
+          terraform init -reconfigure -upgrade \
+            -backend-config="bucket=${TF_BUCKET}" \
+            -backend-config="key=${ENV}/nlb/terraform.tfstate" \
+            -backend-config="region=${BACKEND_REGION}"
+          ARGS=()
+          [ -f "${ENV}.tfvars" ] && ARGS+=(-var-file="${ENV}.tfvars")
+          terraform apply -auto-approve "${ARGS[@]}"
+
+      - name: Terraform Apply API (rest-api)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="infra/environments/${ENV}/stacks/rest-api"
+          if [ ! -d "$DIR" ]; then echo "$DIR not found; skipping"; exit 0; fi
+          cd "$DIR"
+          terraform init -reconfigure -upgrade \
+            -backend-config="bucket=${TF_BUCKET}" \
+            -backend-config="key=${ENV}/rest-api/terraform.tfstate" \
+            -backend-config="region=${BACKEND_REGION}"
+          ARGS=()
+          [ -f "${ENV}.tfvars" ] && ARGS+=(-var-file="${ENV}.tfvars")
+          terraform plan -input=false "${ARGS[@]}" -out=plan.out
           if terraform show -json plan.out | jq -e '((.resource_changes|length) + (.output_changes|length)) > 0' >/dev/null; then
             terraform apply -input=false -auto-approve "plan.out"
           else
             echo "No infra/output changes for rest-api."
           fi
 
-
       - name: Terraform Apply CloudWatch (skip if folder missing)
+        shell: bash
         run: |
-          if [ ! -d infra/cloudwatch ]; then echo "infra/cloudwatch not found; skipping"; exit 0; fi
-          cd infra/cloudwatch
-          terraform init \
+          set -euo pipefail
+          DIR="infra/environments/${ENV}/stacks/cloudwatch"
+          if [ ! -d "$DIR" ]; then echo "$DIR not found; skipping"; exit 0; fi
+          cd "$DIR"
+          terraform init -reconfigure -upgrade \
             -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/cloudwatch/terraform.tfstate" \
+            -backend-config="key=${ENV}/cloudwatch/terraform.tfstate" \
             -backend-config="region=${BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          ARGS=()
+          [ -f "${ENV}.tfvars" ] && ARGS+=(-var-file="${ENV}.tfvars")
+          terraform apply -auto-approve "${ARGS[@]}"
 
       - name: Terraform Apply ECR (capture repo URL) (skip if folder missing)
         id: ecr
+        shell: bash
         run: |
-          if [ ! -d infra/ecr ]; then echo "infra/ecr not found; skipping (will derive repo URL)"; exit 0; fi
-          cd infra/ecr
-          terraform init \
+          set -euo pipefail
+          DIR="infra/environments/${ENV}/stacks/ecr"
+          if [ ! -d "$DIR" ]; then echo "$DIR not found; skipping (will derive repo URL)"; exit 0; fi
+          cd "$DIR"
+          terraform init -reconfigure -upgrade \
             -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ecr/terraform.tfstate" \
+            -backend-config="key=${ENV}/ecr/terraform.tfstate" \
             -backend-config="region=${BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          ARGS=()
+          [ -f "${ENV}.tfvars" ] && ARGS+=(-var-file="${ENV}.tfvars}")
+          terraform apply -auto-approve "${ARGS[@]}"
           ECR_REPO_URL=$(terraform output -raw ecr_repository_url 2>/dev/null || true)
-          if [ -z "$ECR_REPO_URL" ]; then
-            ECR_REPO_URL=$(terraform output -json repository_urls | jq -r '.[0]' 2>/dev/null || true)
+          if [ -z "$ECR_REPO_URL" ] || [ "$ECR_REPO_URL" = "null" ]; then
+            ECR_REPO_URL=$(terraform output -json repository_urls 2>/dev/null | jq -r '.[0]' || true)
           fi
           if [ -n "$ECR_REPO_URL" ] && [ "$ECR_REPO_URL" != "null" ]; then
             echo "ECR_REPO_URL=$ECR_REPO_URL" >> $GITHUB_ENV
@@ -147,34 +167,44 @@ jobs:
 
       - name: Terraform Apply SSM (publish app env) (skip if folder missing)
         id: ssm
+        shell: bash
         run: |
-          if [ ! -d infra/ssm ]; then echo "infra/ssm not found; skipping"; exit 0; fi
-          cd infra/ssm
-          PARAM_NAME="/idlms/shared/${{ github.event.inputs.ENV }}/.env"
+          set -euo pipefail
+          DIR="infra/environments/${ENV}/stacks/app-ssm"
+          if [ ! -d "$DIR" ]; then echo "$DIR not found; skipping"; exit 0; fi
+          cd "$DIR"
+          PARAM_NAME="/idlms/shared/${ENV}/.env"
           if aws ssm get-parameter --name "$PARAM_NAME" --with-decryption > /dev/null 2>&1; then
             ENV_CONTENT=$(aws ssm get-parameter --name "$PARAM_NAME" --with-decryption --query "Parameter.Value" --output text)
             BASE64_ENV=$(echo "$ENV_CONTENT" | base64 -w 0)
           else
             BASE64_ENV=$(echo "# placeholder env" | base64 -w 0)
           fi
-          terraform init \
+          terraform init -reconfigure -upgrade \
             -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ssm/terraform.tfstate" \
+            -backend-config="key=${ENV}/app-ssm/terraform.tfstate" \
             -backend-config="region=${BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars" -var="app_env_content=${BASE64_ENV}"
-          SSM_ENV_PARAM=$(terraform output -raw ssm_env_param_name | tr -d '\r\n' | sed 's/^ssm:\/\///')
-          echo "SSM_ENV_PARAM=$SSM_ENV_PARAM" >> $GITHUB_ENV
+          ARGS=( -var="app_env_content=${BASE64_ENV}" )
+          [ -f "${ENV}.tfvars" ] && ARGS+=(-var-file="${ENV}.tfvars")
+          terraform apply -auto-approve "${ARGS[@]}"
+          SSM_ENV_PARAM=$(terraform output -raw ssm_env_param_name 2>/dev/null | tr -d '\r\n' | sed 's/^ssm:\/\///')
+          [ -n "$SSM_ENV_PARAM" ] && echo "SSM_ENV_PARAM=$SSM_ENV_PARAM" >> $GITHUB_ENV
 
       - name: Terraform Apply S3 (skip if folder missing)
         id: s3_apply
+        shell: bash
         run: |
-          if [ ! -d infra/s3 ]; then echo "infra/s3 not found; skipping"; exit 0; fi
-          cd infra/s3
-          terraform init \
+          set -euo pipefail
+          DIR="infra/environments/${ENV}/stacks/s3"
+          if [ ! -d "$DIR" ]; then echo "$DIR not found; skipping"; exit 0; fi
+          cd "$DIR"
+          terraform init -reconfigure -upgrade \
             -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/s3/terraform.tfstate" \
+            -backend-config="key=${ENV}/s3/terraform.tfstate" \
             -backend-config="region=${BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          ARGS=()
+          [ -f "${ENV}.tfvars" ] && ARGS+=(-var-file="${ENV}.tfvars}")
+          terraform apply -auto-approve "${ARGS[@]}"
 
       # ───────── Build & push (compose + guaranteed fallback) ─────────
       - name: Login to Amazon ECR
@@ -190,12 +220,13 @@ jobs:
           echo "BUILD_TAG=$BUILD_TAG" >> $GITHUB_ENV
 
       - name: Determine ECR repo URL (robust; tries other region if needed)
+        shell: bash
         run: |
           set -euo pipefail
           if [ -n "${ECR_REPO_URL:-}" ] && [ "${ECR_REPO_URL}" != "null" ]; then
             echo "Keeping ECR_REPO_URL from Terraform: ${ECR_REPO_URL}"
             HOST=$(echo "$ECR_REPO_URL" | awk -F/ '{print $1}')
-            ECR_REGION=$(echo "$HOST" | awk -F. '{print $(NF-2)}')   # account.dkr.ecr.<region>.amazonaws.com
+            ECR_REGION=$(echo "$HOST" | awk -F. '{print $(NF-2)}')
             [ -z "$ECR_REGION" ] && ECR_REGION="${AWS_REGION}"
             echo "ECR_REGION=${ECR_REGION}" >> $GITHUB_ENV
             exit 0
@@ -210,7 +241,7 @@ jobs:
             exit 0
           fi
           ACCOUNT_ID="${{ steps.aws-account.outputs.account_id }}"
-          REPO_NAME="${ECR_REPO_NAME:-${{ github.event.inputs.ENV }}-idlms-api}"
+          REPO_NAME="${ECR_REPO_NAME:-${ENV}-idlms-api}"
           ECR_REGION="${AWS_REGION}"
           if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$ECR_REGION" >/dev/null 2>&1; then
             for R in ap-south-1 ap-southeast-1; do
@@ -272,7 +303,7 @@ jobs:
         run: |
           SRC="docker/docker-compose.rendered.yml"
           if [ ! -f "$SRC" ]; then SRC="docker/docker-compose.yml"; fi
-          aws s3 cp "$SRC" "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml" --region "${AWS_REGION}"
+          aws s3 cp "$SRC" "s3://${BACKUP_BUCKET}/${ENV}/docker-compose.yml" --region "${AWS_REGION}"
 
       - name: Resolve EC2 INSTANCE_ID by Name tag
         run: |
@@ -293,7 +324,7 @@ jobs:
       - name: Deploy containers with rollback logic via SSM
         run: |
           TAG_TO_DEPLOY="${{ env.TAG_TO_DEPLOY }}"
-          ENV="${{ github.event.inputs.ENV }}"
+          ENV="${{ env.ENV }}"
           ECR_REPO_URL="${{ env.ECR_REPO_URL }}"
           ECR_REGION="${{ env.ECR_REGION || env.AWS_REGION }}"
           AWS_REGION="${{ env.AWS_REGION }}"

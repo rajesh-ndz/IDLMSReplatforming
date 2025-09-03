@@ -11,13 +11,13 @@ module "nlb" {
   region = "ap-south-1"
 }
 module "cw" {
-  source   = "../../../../platform/app/cloudwatch"
-  region   = var.region
-  env_name = var.env_name
-  enabled  = var.enabled
+  source         = "../../../../platform/app/cloudwatch"
+  region         = var.region
+  env_name       = var.env_name
+  enabled        = var.enabled
   dashboard_name = "IDLMS-${var.env_name}"
-  nlb_arn       = module.nlb.lb_arn
-  instance_id   = module.compute.instance_id
+  nlb_arn        = module.nlb.lb_arn
+  instance_id    = module.compute.instance_id
 }
-output "dashboard_name"   { value = module.cw.dashboard_name }
+output "dashboard_name" { value = module.cw.dashboard_name }
 output "docker_log_group" { value = module.cw.log_group_name }
