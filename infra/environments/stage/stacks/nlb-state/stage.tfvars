@@ -1,5 +1,0 @@
-region         = "ap-south-1"
-state_bucket   = "idlms-terraform-state-backend"
-state_key    = "stage/container/nlb/terraform.tfstate"
-state_region   = "ap-south-1"
-nlb_ssm_prefix = "/idlms/nlb/stage"
