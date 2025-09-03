@@ -12,13 +12,12 @@ variable "vpc_link_id" {
   type        = string
   validation {
     condition     = length(trimspace(var.vpc_link_id)) > 0
-    error_message = "Set vpc_link_id in <env>.tfvars (e.g., hda1q1)."
+    error_message = "vpc_link_id must be set (e.g., hda1q1)."
   }
 }
 
-# Platform (platform-main) remote state coordinates (for NLB)
 variable "platform_state_bucket" {
-  description = "S3 bucket holding platform-main state (e.g., idlms-terraform-state-backend)"
+  description = "S3 bucket that holds platform-main state"
   type        = string
   validation {
     condition     = length(trimspace(var.platform_state_bucket)) > 0
@@ -27,16 +26,16 @@ variable "platform_state_bucket" {
 }
 
 variable "platform_nlb_state_key" {
-  description = "Key in the platform state bucket to the NLB state (e.g., stage/container/nlb/terraform.tfstate)"
+  description = "Key of the platform NLB state file in the bucket"
   type        = string
   validation {
     condition     = length(trimspace(var.platform_nlb_state_key)) > 0
-    error_message = "platform_nlb_state_key must be provided (see stage.tfvars)."
+    error_message = "platform_nlb_state_key must be provided (e.g., stage/container/nlb/terraform.tfstate)."
   }
 }
 
 variable "platform_state_region" {
-  description = "Region of the platform state bucket (e.g., ap-south-1)"
+  description = "Region of the S3 state bucket for platform-main"
   type        = string
   validation {
     condition     = length(trimspace(var.platform_state_region)) > 0
