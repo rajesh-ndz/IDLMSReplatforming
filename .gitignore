@@ -7,3 +7,7 @@ crash.log
 
 # Keep the provider lock file tracked (best practice)
 !.terraform.lock.hcl
+infra/**/.terraform/
+infra/**/*.terraform.lock.hcl
+infra/**/*.tfstate*
+infra/**/*.out
