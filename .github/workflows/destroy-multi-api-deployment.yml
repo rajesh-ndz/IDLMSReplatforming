@@ -13,6 +13,7 @@ env:
   TF_REGION:  ${{ vars.AWS_REGION || 'ap-south-1' }}
   ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
   EC2_INSTANCE_NAME_PATTERN: ${{ vars.EC2_INSTANCE_NAME_PATTERN || format('{0}-idlms-app', github.event.inputs.ENV) }}
+  TF_INPUT: "false"   # prevent terraform prompting anywhere
 
 jobs:
   destroy:
@@ -151,7 +152,7 @@ jobs:
           echo "ECR purge complete."
 
       # ───────────── helper to destroy a module with correct backend region ─────────────
-      - name: Destroy Terraform modules (CloudWatch, API, NLB, ECR, SSM, S3, VPC)
+      - name: Destroy Terraform modules (CloudWatch, API, NLB, ECR)
         run: |
           set -euo pipefail
           ENVIRONMENT="${{ github.event.inputs.ENV }}"
@@ -170,14 +171,14 @@ jobs:
               -backend-config="bucket=${BACKEND_BUCKET}" \
               -backend-config="key=${KEY}" \
               -backend-config="region=${BACKEND_REGION}"
-            # ensure tfvars so TF doesn't prompt
+            # ensure tfvars so TF never prompts
             [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
-            terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars" || true
+            terraform destroy -auto-approve -input=false -var-file="${ENVIRONMENT}.tfvars" || true
             cd - >/dev/null
             echo "::endgroup::"
           }
 
-          # Order matters: CW -> API -> NLB -> ECR -> SSM -> S3 -> VPC
+          # Order matters: CW -> API -> NLB -> ECR
           tfd "cloudwatch" "${ENVIRONMENT}/cloudwatch/terraform.tfstate"
           tfd "rest-api"   "${ENVIRONMENT}/rest-api/terraform.tfstate"
           tfd "nlb"        "${ENVIRONMENT}/nlb/terraform.tfstate"
@@ -196,12 +197,13 @@ jobs:
               -backend-config="bucket=${BACKEND_BUCKET}" \
               -backend-config="key=${ENVIRONMENT}/ssm/terraform.tfstate" \
               -backend-config="region=${BACKEND_REGION}"
-            # ensure tfvars
-            [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
-            # import-if-exists so TF can delete
-            terraform import aws_ssm_parameter.app_env "/idlms/shared/${ENVIRONMENT}/.env" || true
-            terraform import aws_ssm_parameter.last_success "/idlms/license-api/last-successful-build" || true
-            terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars" || true
+            # ensure tfvars and feed var.env to import
+            echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
+            export TF_VAR_env="${ENVIRONMENT}"
+            export TF_INPUT=false
+            terraform import -input=false aws_ssm_parameter.app_env      "/idlms/shared/${ENVIRONMENT}/.env" || true
+            terraform import -input=false aws_ssm_parameter.last_success "/idlms/license-api/last-successful-build" || true
+            terraform destroy -auto-approve -input=false -var-file="${ENVIRONMENT}.tfvars" || true
             cd - >/dev/null
           else
             echo "infra/ssm missing; doing CLI fallback deletes (best effort)"
@@ -227,7 +229,7 @@ jobs:
             -backend-config="key=${ENVIRONMENT}/s3/terraform.tfstate" \
             -backend-config="region=${BACKEND_REGION}"
           [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
-          terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars"
+          terraform destroy -auto-approve -input=false -var-file="${ENVIRONMENT}.tfvars"
 
       - name: Destroy VPC (skip if missing)
         run: |
@@ -242,4 +244,4 @@ jobs:
             -backend-config="key=${ENVIRONMENT}/vpc/terraform.tfstate" \
             -backend-config="region=${BACKEND_REGION}"
           [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
-          terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars"
+          terraform destroy -auto-approve -input=false -var-file="${ENVIRONMENT}.tfvars"
