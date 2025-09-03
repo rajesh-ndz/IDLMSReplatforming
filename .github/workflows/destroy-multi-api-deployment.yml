@@ -49,7 +49,7 @@ jobs:
 
       - name: Set TF bucket and artifact bucket
         run: |
-          echo "TF_BUCKET=${{ github.event.inputs.ENV }}-btl-idlms-website-backend-api-tfstate-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
+          echo "TF_BUCKET=${{ github.event.inputs.ENV }}-btl-idlms-backend-api-tfstate-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
           echo "BACKUP_BUCKET=idlms-${{ github.event.inputs.ENV }}-website-built-artifact-${{ steps.aws-account.outputs.account_id }}" >> $GITHUB_ENV
           echo "Using TF_BUCKET=$TF_BUCKET"
           echo "Using BACKUP_BUCKET=$BACKUP_BUCKET"
