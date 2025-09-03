@@ -79,16 +79,27 @@ jobs:
             -backend-config="region=${TF_REGION}"
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
 
-      - name: Terraform Apply API Gateway (skip if folder missing)
+      - name: Terraform Apply API (rest-api)
         run: |
-          if [ ! -d infra/rest-api ]; then echo "infra/rest-api not found; skipping"; exit 0; fi
+          set -euo pipefail
           cd infra/rest-api
-          terraform init \
+              
+          terraform init -reconfigure -upgrade \
             -backend-config="bucket=${TF_BUCKET}" \
             -backend-config="key=${{ github.event.inputs.ENV }}/rest-api/terraform.tfstate" \
             -backend-config="region=${TF_REGION}"
-          terraform refresh -var-file="${{ github.event.inputs.ENV }}.tfvars"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+              
+          terraform plan -input=false \
+            -var-file="${{ github.event.inputs.ENV }}.tfvars" \
+            -out=plan.out
+              
+          # apply only if there are changes
+          if terraform show -json plan.out | jq -e '.resource_changes | length > 0' >/dev/null; then
+            terraform apply -input=false -auto-approve "plan.out"
+          else
+            echo "No changes for rest-api."
+          fi
+
 
       - name: Terraform Apply CloudWatch (skip if folder missing)
         run: |
