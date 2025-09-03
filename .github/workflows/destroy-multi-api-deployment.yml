@@ -11,7 +11,6 @@ on:
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
   TF_REGION:  ${{ vars.AWS_REGION || 'ap-south-1' }}
-  # Optional overrides via repo variables
   ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
   EC2_INSTANCE_NAME_PATTERN: ${{ vars.EC2_INSTANCE_NAME_PATTERN || format('{0}-idlms-app', github.event.inputs.ENV) }}
 
@@ -45,8 +44,7 @@ jobs:
 
       - name: Get AWS Account ID
         id: aws-account
-        run: |
-          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+        run: echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
 
       - name: Set TF bucket and artifact bucket
         run: |
@@ -55,7 +53,18 @@ jobs:
           echo "Using TF_BUCKET=$TF_BUCKET"
           echo "Using BACKUP_BUCKET=$BACKUP_BUCKET"
 
-      # ────────────────────── STOP APP FIRST (EC2 via SSM) ──────────────────────
+      - name: Detect backend (S3) region (IMPORTANT)
+        run: |
+          set -euo pipefail
+          BKT_REGION=$(aws s3api get-bucket-location \
+            --bucket "${TF_BUCKET}" \
+            --query 'LocationConstraint' \
+            --output text)
+          [ -z "$BKT_REGION" ] || [ "$BKT_REGION" = "None" ] && BKT_REGION="us-east-1"
+          echo "BACKEND_REGION=$BKT_REGION" >> $GITHUB_ENV
+          echo "Terraform state bucket region: $BKT_REGION"
+
+      # ───────────── stop app first ─────────────
       - name: Resolve EC2 instance by Name tag (best effort)
         id: resolve-iid
         continue-on-error: true
@@ -94,7 +103,7 @@ jobs:
             --timeout-seconds 300 \
             --region "${{ env.AWS_REGION }}"
 
-      # ─────────────────── CLEAN ARTIFACTS (S3 + ECR) ───────────────────
+      # ───────────── clean artifacts ─────────────
       - name: Empty artifact S3 prefix for this env (best effort)
         continue-on-error: true
         run: |
@@ -102,17 +111,14 @@ jobs:
           echo "Emptying s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/ ..."
           aws s3 rm "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/" --recursive --region "${AWS_REGION}" || true
 
-      - name: Derive ECR repo URL / region
+      - name: Derive ECR repo URL / region (best effort)
         id: ecr-derive
         continue-on-error: true
         run: |
           set -euo pipefail
           ACCOUNT_ID="${{ steps.aws-account.outputs.account_id }}"
-          # default repo name is "<env>-idlms-api" unless ECR_REPO_NAME override provided
           REPO_NAME="${ECR_REPO_NAME:-${{ github.event.inputs.ENV }}-idlms-api}"
-          # prefer configured region
           ECR_REGION="${AWS_REGION}"
-          # if repo not in this region, try a couple common fallbacks
           if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$ECR_REGION" >/dev/null 2>&1; then
             for R in ap-south-1 ap-southeast-1; do
               if [ "$R" != "$ECR_REGION" ] && aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$R" >/dev/null 2>&1; then
@@ -135,7 +141,6 @@ jobs:
           set -euo pipefail
           REPO_NAME="$(echo "${ECR_REPO_URL}" | cut -d/ -f2)"
           echo "Purging ALL images in $REPO_NAME (${ECR_REGION}) ..."
-          # delete tagged + untagged images in batches
           while : ; do
             IDS=$(aws ecr list-images --repository-name "$REPO_NAME" --region "${ECR_REGION}" --query 'imageIds' --output json)
             COUNT=$(echo "$IDS" | jq 'length')
@@ -145,56 +150,64 @@ jobs:
           done
           echo "ECR purge complete."
 
-      # ───────────────────── TF DESTROY (safe order) ─────────────────────
-      - name: Destroy CloudWatch (skip if missing)
+      # ───────────── helper to destroy a module with correct backend region ─────────────
+      - name: Destroy Terraform modules (CloudWatch, API, NLB, ECR, SSM, S3, VPC)
         run: |
-          if [ ! -d infra/cloudwatch ]; then echo "infra/cloudwatch not found; skipping"; exit 0; fi
-          cd infra/cloudwatch
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/cloudwatch/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-          terraform destroy -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          set -euo pipefail
+          ENVIRONMENT="${{ github.event.inputs.ENV }}"
+          BACKEND_BUCKET="${TF_BUCKET}"
+          BACKEND_REGION="${BACKEND_REGION}"
 
-      - name: Destroy API Gateway (skip if missing)
-        run: |
-          if [ ! -d infra/rest-api ]; then echo "infra/rest-api not found; skipping"; exit 0; fi
-          cd infra/rest-api
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/rest-api/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-          terraform destroy -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          tfd() {
+            MOD="$1" ; KEY="$2"
+            if [ ! -d "infra/${MOD}" ]; then
+              echo "infra/${MOD} not found; skipping"
+              return 0
+            fi
+            echo "::group::Destroy ${MOD}"
+            cd "infra/${MOD}"
+            terraform init -reconfigure -upgrade \
+              -backend-config="bucket=${BACKEND_BUCKET}" \
+              -backend-config="key=${KEY}" \
+              -backend-config="region=${BACKEND_REGION}"
+            # ensure tfvars so TF doesn't prompt
+            [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
+            terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars" || true
+            cd - >/dev/null
+            echo "::endgroup::"
+          }
 
-      - name: Destroy NLB (skip if missing)
-        run: |
-          if [ ! -d infra/nlb ]; then echo "infra/nlb not found; skipping"; exit 0; fi
-          cd infra/nlb
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/nlb/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-          terraform destroy -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          # Order matters: CW -> API -> NLB -> ECR -> SSM -> S3 -> VPC
+          tfd "cloudwatch" "${ENVIRONMENT}/cloudwatch/terraform.tfstate"
+          tfd "rest-api"   "${ENVIRONMENT}/rest-api/terraform.tfstate"
+          tfd "nlb"        "${ENVIRONMENT}/nlb/terraform.tfstate"
+          tfd "ecr"        "${ENVIRONMENT}/ecr/terraform.tfstate"
 
-      - name: Destroy ECR (skip if missing)
+      - name: Destroy SSM (import-if-exists, correct backend region)
         run: |
-          if [ ! -d infra/ecr ]; then echo "infra/ecr not found; skipping"; exit 0; fi
-          cd infra/ecr
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ecr/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-          terraform destroy -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          set -euo pipefail
+          ENVIRONMENT="${{ github.event.inputs.ENV }}"
+          BACKEND_BUCKET="${TF_BUCKET}"
+          BACKEND_REGION="${BACKEND_REGION}"
 
-      - name: Destroy SSM (skip if missing)
-        run: |
-          if [ ! -d infra/ssm ]; then echo "infra/ssm not found; skipping"; exit 0; fi
-          cd infra/ssm
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ssm/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-          terraform destroy -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          if [ -d infra/ssm ]; then
+            cd infra/ssm
+            terraform init -reconfigure -upgrade \
+              -backend-config="bucket=${BACKEND_BUCKET}" \
+              -backend-config="key=${ENVIRONMENT}/ssm/terraform.tfstate" \
+              -backend-config="region=${BACKEND_REGION}"
+            # ensure tfvars
+            [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
+            # import-if-exists so TF can delete
+            terraform import aws_ssm_parameter.app_env "/idlms/shared/${ENVIRONMENT}/.env" || true
+            terraform import aws_ssm_parameter.last_success "/idlms/license-api/last-successful-build" || true
+            terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars" || true
+            cd - >/dev/null
+          else
+            echo "infra/ssm missing; doing CLI fallback deletes (best effort)"
+            aws ssm delete-parameter --name "/idlms/shared/${ENVIRONMENT}/.env" --region "${AWS_REGION}" || true
+            aws ssm delete-parameter --name "/idlms/license-api/last-successful-build" --region "${AWS_REGION}" || true
+          fi
 
       - name: Empty S3 bucket prefix again (best effort)
         continue-on-error: true
@@ -203,20 +216,30 @@ jobs:
 
       - name: Destroy S3 (skip if missing)
         run: |
+          set -euo pipefail
+          ENVIRONMENT="${{ github.event.inputs.ENV }}"
+          BACKEND_BUCKET="${TF_BUCKET}"
+          BACKEND_REGION="${BACKEND_REGION}"
           if [ ! -d infra/s3 ]; then echo "infra/s3 not found; skipping"; exit 0; fi
           cd infra/s3
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/s3/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-          terraform destroy -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          terraform init -reconfigure -upgrade \
+            -backend-config="bucket=${BACKEND_BUCKET}" \
+            -backend-config="key=${ENVIRONMENT}/s3/terraform.tfstate" \
+            -backend-config="region=${BACKEND_REGION}"
+          [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
+          terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars"
 
       - name: Destroy VPC (skip if missing)
         run: |
+          set -euo pipefail
+          ENVIRONMENT="${{ github.event.inputs.ENV }}"
+          BACKEND_BUCKET="${TF_BUCKET}"
+          BACKEND_REGION="${BACKEND_REGION}"
           if [ ! -d infra/vpc ]; then echo "infra/vpc not found; skipping"; exit 0; fi
           cd infra/vpc
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" \
-            -backend-config="region=${TF_REGION}"
-          terraform destroy -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          terraform init -reconfigure -upgrade \
+            -backend-config="bucket=${BACKEND_BUCKET}" \
+            -backend-config="key=${ENVIRONMENT}/vpc/terraform.tfstate" \
+            -backend-config="region=${BACKEND_REGION}"
+          [ -f "${ENVIRONMENT}.tfvars" ] || echo "env = \"${ENVIRONMENT}\"" > "${ENVIRONMENT}.tfvars"
+          terraform destroy -auto-approve -var-file="${ENVIRONMENT}.tfvars"
