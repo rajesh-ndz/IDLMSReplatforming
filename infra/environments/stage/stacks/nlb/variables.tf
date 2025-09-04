@@ -1,32 +1,33 @@
-variable "region" { type = string }
-variable "env_name" { type = string }
-
-variable "publish_to_ssm" {
-  type    = bool
-  default = true
+variable "env_name" {
+  type    = string
+  default = "stage"
 }
 
-variable "ssm_prefix" {
+variable "region" {
   type    = string
-  default = "/idlms/nlb/stage"
+  default = "ap-south-1"
 }
 
-# Optional: read NLB from another stack's state (S3 backend)
-variable "use_remote_state" {
-  type    = bool
-  default = false
+variable "nlb_name" {
+  type    = string
+  default = "stage-stage-nlb"
 }
 
-# Only needed if use_remote_state = true
-variable "remote_state_bucket" {
-  type    = string
-  default = null
+variable "target_port" {
+  type    = number
+  default = 4000
 }
-variable "remote_state_key" {
-  type    = string
-  default = null
+
+# Private IP of your app instance (in the NLB's VPC)
+variable "target_ip" {
+  type = string
 }
-variable "remote_state_region" {
-  type    = string
-  default = null
+
+variable "tags" {
+  type = map(string)
+  default = {
+    Project = "IDLMS"
+    Env     = "stage"
+    Owner   = "Rajesh.R"
+  }
 }
