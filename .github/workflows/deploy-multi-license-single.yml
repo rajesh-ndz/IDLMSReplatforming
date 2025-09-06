@@ -74,6 +74,7 @@ jobs:
               echo "::error::No platform_state_bucket mapping for ENV=$ENV_NAME"; exit 1 ;;
           esac
           mkdir -p infra/platform-remote
+
           cat > infra/platform-remote/provider.tf <<'TF'
           terraform {
             required_version = ">= 1.5.0"
@@ -83,12 +84,14 @@ jobs:
           }
           provider "aws" { region = var.region }
           TF
+
           cat > infra/platform-remote/variables.tf <<'TF'
           variable "env_name"              { type = string }
           variable "region"                { type = string }
           variable "platform_state_bucket" { type = string }
           variable "platform_state_region" { type = string }
           TF
+
           cat > infra/platform-remote/main.tf <<'TF'
           locals {
             network_key  = "${var.env_name}/network/terraform.tfstate"
@@ -97,12 +100,53 @@ jobs:
             ecr_key      = "${var.env_name}/ecr/terraform.tfstate"
             rest_api_key = "${var.env_name}/rest-api/terraform.tfstate"
           }
-          data "terraform_remote_state" "network" { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.network_key,  region = var.platform_state_region } }
-          data "terraform_remote_state" "compute" { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.compute_key,  region = var.platform_state_region } }
-          data "terraform_remote_state" "nlb"     { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.nlb_key,     region = var.platform_state_region } }
-          data "terraform_remote_state" "ecr"     { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.ecr_key,     region = var.platform_state_region } }
-          data "terraform_remote_state" "rest_api"{ backend = "s3" config = { bucket = var.platform_state_bucket, key = local.rest_api_key,region = var.platform_state_region } }
+
+          data "terraform_remote_state" "network" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.network_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "compute" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.compute_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "nlb" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.nlb_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "ecr" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.ecr_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "rest_api" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.rest_api_key
+              region = var.platform_state_region
+            }
+          }
           TF
+
           cat > infra/platform-remote/outputs.tf <<'TF'
           output "vpc_id"              { value = try(data.terraform_remote_state.network.outputs.vpc_id, null) }
           output "public_subnet_ids"   { value = try(data.terraform_remote_state.network.outputs.public_subnet_ids, []) }
@@ -116,6 +160,7 @@ jobs:
           output "apigw_invoke_url"    { value = try(data.terraform_remote_state.rest_api.outputs.invoke_url, null) }
           output "apigw_stage_name"    { value = try(data.terraform_remote_state.rest_api.outputs.stage_name, null) }
           TF
+
           cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
           env_name              = "${ENV_NAME}"
           region                = "${REGION}"
@@ -203,7 +248,7 @@ jobs:
           terraform_version: 1.7.5
           terraform_wrapper: false
 
-      # ─────────────────── Bootstrap TF reader + ${ENV}.tfvars (again, new runner) ───────────────────
+      # ─────────────────── Bootstrap TF reader + ${ENV}.tfvars (new runner) ───────────────────
       - name: Bootstrap platform-remote terraform + ${ENV}.tfvars
         run: |
           set -euo pipefail
@@ -219,6 +264,7 @@ jobs:
               echo "::error::No platform_state_bucket mapping for ENV=$ENV_NAME"; exit 1 ;;
           esac
           mkdir -p infra/platform-remote
+
           cat > infra/platform-remote/provider.tf <<'TF'
           terraform {
             required_version = ">= 1.5.0"
@@ -228,12 +274,14 @@ jobs:
           }
           provider "aws" { region = var.region }
           TF
+
           cat > infra/platform-remote/variables.tf <<'TF'
           variable "env_name"              { type = string }
           variable "region"                { type = string }
           variable "platform_state_bucket" { type = string }
           variable "platform_state_region" { type = string }
           TF
+
           cat > infra/platform-remote/main.tf <<'TF'
           locals {
             network_key  = "${var.env_name}/network/terraform.tfstate"
@@ -242,12 +290,53 @@ jobs:
             ecr_key      = "${var.env_name}/ecr/terraform.tfstate"
             rest_api_key = "${var.env_name}/rest-api/terraform.tfstate"
           }
-          data "terraform_remote_state" "network" { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.network_key,  region = var.platform_state_region } }
-          data "terraform_remote_state" "compute" { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.compute_key,  region = var.platform_state_region } }
-          data "terraform_remote_state" "nlb"     { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.nlb_key,     region = var.platform_state_region } }
-          data "terraform_remote_state" "ecr"     { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.ecr_key,     region = var.platform_state_region } }
-          data "terraform_remote_state" "rest_api"{ backend = "s3" config = { bucket = var.platform_state_bucket, key = local.rest_api_key,region = var.platform_state_region } }
+
+          data "terraform_remote_state" "network" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.network_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "compute" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.compute_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "nlb" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.nlb_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "ecr" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.ecr_key
+              region = var.platform_state_region
+            }
+          }
+
+          data "terraform_remote_state" "rest_api" {
+            backend = "s3"
+            config = {
+              bucket = var.platform_state_bucket
+              key    = local.rest_api_key
+              region = var.platform_state_region
+            }
+          }
           TF
+
           cat > infra/platform-remote/outputs.tf <<'TF'
           output "vpc_id"              { value = try(data.terraform_remote_state.network.outputs.vpc_id, null) }
           output "public_subnet_ids"   { value = try(data.terraform_remote_state.network.outputs.public_subnet_ids, []) }
@@ -261,6 +350,7 @@ jobs:
           output "apigw_invoke_url"    { value = try(data.terraform_remote_state.rest_api.outputs.invoke_url, null) }
           output "apigw_stage_name"    { value = try(data.terraform_remote_state.rest_api.outputs.stage_name, null) }
           TF
+
           cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
           env_name              = "${ENV_NAME}"
           region                = "${REGION}"
