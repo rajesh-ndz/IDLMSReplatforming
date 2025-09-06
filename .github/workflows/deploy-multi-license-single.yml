@@ -58,16 +58,12 @@ jobs:
           terraform_version: 1.7.5
           terraform_wrapper: false
 
-      # ─────────────────── Self-healing TF reader bootstrap ───────────────────
       - name: Bootstrap platform-remote terraform + ${ENV}.tfvars
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
-          echo "Terraform version:" && terraform version
-
           ENV_NAME="${{ github.event.inputs.ENV }}"
           REGION="${{ env.AWS_REGION }}"
-
           case "$ENV_NAME" in
             stage)
               PLATFORM_STATE_BUCKET="stage-btl-idlms-repo-backend-api-tfstate-592776312448"
@@ -76,29 +72,22 @@ jobs:
             *)
               echo "::error::No platform_state_bucket mapping for ENV=$ENV_NAME"; exit 1 ;;
           esac
-
           mkdir -p infra/platform-remote
-
           cat > infra/platform-remote/provider.tf <<'TF'
           terraform {
             required_version = ">= 1.5.0"
             required_providers {
-              aws = {
-                source  = "hashicorp/aws"
-                version = ">= 5.0"
-              }
+              aws = { source = "hashicorp/aws", version = ">= 5.0" }
             }
           }
           provider "aws" { region = var.region }
           TF
-
           cat > infra/platform-remote/variables.tf <<'TF'
-          variable "env_name"               { type = string }
-          variable "region"                 { type = string }
-          variable "platform_state_bucket"  { type = string }
-          variable "platform_state_region"  { type = string }
+          variable "env_name"              { type = string }
+          variable "region"                { type = string }
+          variable "platform_state_bucket" { type = string }
+          variable "platform_state_region" { type = string }
           TF
-
           cat > infra/platform-remote/main.tf <<'TF'
           locals {
             network_key  = "${var.env_name}/network/terraform.tfstate"
@@ -107,28 +96,12 @@ jobs:
             ecr_key      = "${var.env_name}/ecr/terraform.tfstate"
             rest_api_key = "${var.env_name}/rest-api/terraform.tfstate"
           }
-          data "terraform_remote_state" "network" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.network_key,  region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "compute" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.compute_key,  region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "nlb" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.nlb_key,      region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "ecr" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.ecr_key,      region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "rest_api" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.rest_api_key, region = var.platform_state_region }
-          }
+          data "terraform_remote_state" "network" { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.network_key,  region = var.platform_state_region } }
+          data "terraform_remote_state" "compute" { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.compute_key,  region = var.platform_state_region } }
+          data "terraform_remote_state" "nlb"     { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.nlb_key,     region = var.platform_state_region } }
+          data "terraform_remote_state" "ecr"     { backend = "s3" config = { bucket = var.platform_state_bucket, key = local.ecr_key,     region = var.platform_state_region } }
+          data "terraform_remote_state" "rest_api"{ backend = "s3" config = { bucket = var.platform_state_bucket, key = local.rest_api_key,region = var.platform_state_region } }
           TF
-
           cat > infra/platform-remote/outputs.tf <<'TF'
           output "vpc_id"              { value = try(data.terraform_remote_state.network.outputs.vpc_id, null) }
           output "public_subnet_ids"   { value = try(data.terraform_remote_state.network.outputs.public_subnet_ids, []) }
@@ -142,7 +115,6 @@ jobs:
           output "apigw_invoke_url"    { value = try(data.terraform_remote_state.rest_api.outputs.invoke_url, null) }
           output "apigw_stage_name"    { value = try(data.terraform_remote_state.rest_api.outputs.stage_name, null) }
           TF
-
           cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
           env_name              = "${ENV_NAME}"
           region                = "${REGION}"
@@ -158,25 +130,20 @@ jobs:
           terraform init -upgrade
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
           terraform output -json > /tmp/platform_remote.json
-          # Try multiple common keys for ECR repo output
           ECR_REPO_URL=$(jq -r '(.ecr_repository_url.value // .repository_url.value // .ecr_repo_url.value // empty)' /tmp/platform_remote.json)
           TARGET_INSTANCE_ID=$(jq -r '.compute_instance_id.value // empty' /tmp/platform_remote.json)
           echo "ECR_REPO_URL=$ECR_REPO_URL" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
           echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
 
-      # NEW: fallback if ecr_repository_url wasn't in TF outputs
       - name: Discover ECR repo URL (fallback)
         if: ${{ env.ECR_REPO_URL == '' }}
         run: |
           set -euo pipefail
           AWS_REGION="${{ env.AWS_REGION }}"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          # List repos and pick the most likely (prefer names containing idlms/license/api or current ENV)
-          candidates="$(aws ecr describe-repositories --region "$AWS_REGION" --query 'repositories[].repositoryName' --output text | tr '\t' '\n' || true)"
-          echo "ECR candidates:"; echo "$candidates" | sed 's/^/- /'
-          NAME="$(echo "$candidates" | grep -Ei '(^|-)stage(-|$)|idlms|license|api' | head -n1 || true)"
+          NAME="$(aws ecr describe-repositories --region "$AWS_REGION" --query 'repositories[].repositoryName' --output text | tr '\t' '\n' | grep -Ei '(^|-)stage(-|$)|idlms|license|api' | head -n1 || true)"
           if [ -z "$NAME" ]; then
-            echo "::error::No suitable ECR repository found. Create one or ensure platform state has ECR."; exit 1
+            echo "::error::No suitable ECR repository found."; exit 1
           fi
           URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAME}"
           echo "ECR_REPO_URL=$URL" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
@@ -235,98 +202,11 @@ jobs:
           terraform_version: 1.7.5
           terraform_wrapper: false
 
-      # ─────────────────── Self-healing TF reader bootstrap ───────────────────
-      - name: Bootstrap platform-remote terraform + ${ENV}.tfvars
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y && sudo apt-get install -y jq
-          echo "Terraform version:" && terraform version
-
-          ENV_NAME="${{ github.event.inputs.ENV }}"
-          REGION="${{ env.AWS_REGION }}"
-
-          case "$ENV_NAME" in
-            stage)
-              PLATFORM_STATE_BUCKET="stage-btl-idlms-repo-backend-api-tfstate-592776312448"
-              PLATFORM_STATE_REGION="ap-south-1"
-              ;;
-            *)
-              echo "::error::No platform_state_bucket mapping for ENV=$ENV_NAME"; exit 1 ;;
-          esac
-
-          mkdir -p infra/platform-remote
-
-          cat > infra/platform-remote/provider.tf <<'TF'
-          terraform {
-            required_version = ">= 1.5.0"
-            required_providers {
-              aws = {
-                source  = "hashicorp/aws"
-                version = ">= 5.0"
-              }
-            }
-          }
-          provider "aws" { region = var.region }
-          TF
-          cat > infra/platform-remote/variables.tf <<'TF'
-          variable "env_name"               { type = string }
-          variable "region"                 { type = string }
-          variable "platform_state_bucket"  { type = string }
-          variable "platform_state_region"  { type = string }
-          TF
-          cat > infra/platform-remote/main.tf <<'TF'
-          locals {
-            network_key  = "${var.env_name}/network/terraform.tfstate"
-            compute_key  = "${var.env_name}/compute/terraform.tfstate"
-            nlb_key      = "${var.env_name}/nlb/terraform.tfstate"
-            ecr_key      = "${var.env_name}/ecr/terraform.tfstate"
-            rest_api_key = "${var.env_name}/rest-api/terraform.tfstate"
-          }
-          data "terraform_remote_state" "network" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.network_key,  region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "compute" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.compute_key,  region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "nlb" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.nlb_key,      region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "ecr" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.ecr_key,      region = var.platform_state_region }
-          }
-          data "terraform_remote_state" "rest_api" {
-            backend = "s3"
-            config = { bucket = var.platform_state_bucket, key = local.rest_api_key, region = var.platform_state_region }
-          }
-          TF
-          cat > infra/platform-remote/outputs.tf <<'TF'
-          output "vpc_id"              { value = try(data.terraform_remote_state.network.outputs.vpc_id, null) }
-          output "public_subnet_ids"   { value = try(data.terraform_remote_state.network.outputs.public_subnet_ids, []) }
-          output "private_subnet_ids"  { value = try(data.terraform_remote_state.network.outputs.private_subnet_ids, []) }
-          output "ecr_repository_url"  { value = try(data.terraform_remote_state.ecr.outputs.ecr_repository_url, null) }
-          output "compute_instance_id" { value = try(data.terraform_remote_state.compute.outputs.instance_id, null) }
-          output "nlb_dns_name"        { value = try(data.terraform_remote_state.nlb.outputs.nlb_dns_name, null) }
-          output "nlb_zone_id"         { value = try(data.terraform_remote_state.nlb.outputs.nlb_zone_id, null) }
-          output "listener_4000"       { value = try(data.terraform_remote_state.nlb.outputs.listener_4000, null) }
-          output "tg_4000"             { value = try(data.terraform_remote_state.nlb.outputs.tg_4000, null) }
-          output "apigw_invoke_url"    { value = try(data.terraform_remote_state.rest_api.outputs.invoke_url, null) }
-          output "apigw_stage_name"    { value = try(data.terraform_remote_state.rest_api.outputs.stage_name, null) }
-          TF
-          cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
-          env_name              = "${ENV_NAME}"
-          region                = "${REGION}"
-          platform_state_bucket = "${PLATFORM_STATE_BUCKET}"
-          platform_state_region = "${PLATFORM_STATE_REGION}"
-          EOF
-
       - name: Re-read platform-main outputs
         id: platform
         run: |
           set -euo pipefail
+          sudo apt-get update -y && sudo apt-get install -y jq
           cd infra/platform-remote
           terraform init -upgrade
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
@@ -336,26 +216,9 @@ jobs:
           echo "ECR_REPO_URL=${ECR_REPO_URL}" >> "$GITHUB_ENV"
           echo "TARGET_INSTANCE_ID=${TARGET_INSTANCE_ID}" >> "$GITHUB_ENV"
 
-      # NEW: fallback if TF outputs didn't contain the ECR url
-      - name: Discover ECR repo URL (fallback)
-        if: ${{ env.ECR_REPO_URL == '' }}
-        run: |
-          set -euo pipefail
-          AWS_REGION="${{ env.AWS_REGION }}"
-          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          candidates="$(aws ecr describe-repositories --region "$AWS_REGION" --query 'repositories[].repositoryName' --output text | tr '\t' '\n' || true)"
-          echo "ECR candidates:"; echo "$candidates" | sed 's/^/- /'
-          NAME="$(echo "$candidates" | grep -Ei '(^|-)stage(-|$)|idlms|license|api' | head -n1 || true)"
-          if [ -z "$NAME" ]; then
-            echo "::error::No suitable ECR repository found. Create one or ensure platform state has ECR."; exit 1
-          fi
-          URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAME}"
-          echo "ECR_REPO_URL=$URL" >> "$GITHUB_ENV"
-
       - uses: aws-actions/amazon-ecr-login@v2
 
       - name: Compute account id & artifact bucket
-        id: acct
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           BACKUP_BUCKET="idlms-${{ github.event.inputs.ENV }}-built-artifact-${ACCOUNT_ID}"
@@ -378,55 +241,53 @@ jobs:
         run: |
           aws s3 cp docker/docker-compose.yml "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml" --region "${{ env.AWS_REGION }}"
 
-      - name: Deploy containers with rollback via SSM
+      # ⬇⬇⬇ FIXED: build deploy.json with jq and pass via file:// to avoid quoting errors
+      - name: Deploy containers with rollback via SSM (safe JSON)
         run: |
           set -euo pipefail
-          if [ -z "${{ env.TARGET_INSTANCE_ID }}" ] || [ "${{ env.TARGET_INSTANCE_ID }}" = "null" ]; then
-            echo "::error::No compute instance id from platform-main (TARGET_INSTANCE_ID is empty)."
-            exit 1
-          fi
           ENV="${{ github.event.inputs.ENV }}"
           AWS_REGION="${{ env.AWS_REGION }}"
           ECR_REPO_URL="${{ env.ECR_REPO_URL }}"
+          ECR_REGISTRY="${ECR_REPO_URL%/*}"
           BACKUP_BUCKET="${{ env.BACKUP_BUCKET }}"
           TAG_TO_DEPLOY="${{ env.TAG_TO_DEPLOY }}"
+          INSTANCE_ID="${{ env.TARGET_INSTANCE_ID }}"
+
+          jq -n \
+            --arg env "$ENV" \
+            --arg region "$AWS_REGION" \
+            --arg tag "$TAG_TO_DEPLOY" \
+            --arg repo "$ECR_REPO_URL" \
+            --arg registry "$ECR_REGISTRY" \
+            --arg bucket "$BACKUP_BUCKET" \
+            '{
+              commands: [
+                "set -e",
+                "cd /home/ubuntu",
+                ("ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/\($env)/.env\" --with-decryption --query \"Parameter.Value\" --output text --region \($region))"),
+                "echo \"$ENV_CONTENT\" > .env",
+                ("echo \"BUILD_TAG=\($tag)\" >> .env"),
+                ("echo \"IMAGE_REPO=\($repo)\" >> .env"),
+                ("aws s3 cp s3://\($bucket)/\($env)/docker-compose.yml docker-compose.yml --region \($region)"),
+                "if ! command -v docker &> /dev/null; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
+                "if ! command -v docker-compose &> /dev/null; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
+                ("aws ecr get-login-password --region \($region) | docker login --username AWS --password-stdin \($registry)"),
+                "docker-compose --env-file .env down || true",
+                ("docker rmi \($repo):\($tag) || true"),
+                "docker-compose --env-file .env pull --ignore-pull-failures",
+                "docker-compose --env-file .env up -d --force-recreate",
+                "sleep 60",
+                "RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E \"api1|api2|api3\" | wc -l)",
+                ("if [ \"$RUNNING_CONTAINERS\" -ne 3 ]; then echo \"Deployment failed. Rolling back...\"; PREV_TAG=$(aws ssm get-parameter --name \"/idlms/license-api/last-successful-build\" --query \"Parameter.Value\" --output text --region \($region)); echo \"Rolling back to tag: $PREV_TAG\"; sed -i '/BUILD_TAG=/d' .env; echo \"BUILD_TAG=$PREV_TAG\" >> .env; docker-compose --env-file .env down || true; docker rmi \($repo):\($tag) || true; docker-compose --env-file .env pull --ignore-pull-failures; docker-compose --env-file .env up -d --force-recreate; else echo \"All containers are up. Saving \($tag) as last-successful-build...\"; aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \($tag) --type String --overwrite --region \($region); fi"),
+                "docker ps"
+              ]
+            }' > deploy.json
 
           aws ssm send-command \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "${{ env.TARGET_INSTANCE_ID }}" \
+            --instance-ids "$INSTANCE_ID" \
             --comment "Deploy containers with rollback logic" \
-            --parameters 'commands=[
-              "set -e",
-              "cd /home/ubuntu",
-              "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/'"$ENV"'/.env\" --with-decryption --query \"Parameter.Value\" --output text --region '\"$AWS_REGION\"')",
-              "echo \"$ENV_CONTENT\" > .env",
-              "echo \"BUILD_TAG='\"$TAG_TO_DEPLOY\"'\" >> .env",
-              "echo \"IMAGE_REPO='\"$ECR_REPO_URL\"'\" >> .env",
-              "aws s3 cp s3://'\"$BACKUP_BUCKET\"'/'\"$ENV\"'/docker-compose.yml docker-compose.yml --region '\"$AWS_REGION\"'",
-              "if ! command -v docker &> /dev/null; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
-              "if ! command -v docker-compose &> /dev/null; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
-              "aws ecr get-login-password --region '\"$AWS_REGION\"' | docker login --username AWS --password-stdin '\"${ECR_REPO_URL%/*}\"'",
-              "docker-compose --env-file .env down || true",
-              "docker rmi ${ECR_REPO_URL}:${TAG_TO_DEPLOY} || true",
-              "docker-compose --env-file .env pull --ignore-pull-failures",
-              "docker-compose --env-file .env up -d --force-recreate",
-              "sleep 60",
-              "RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -E \\\"api1|api2|api3\\\" | wc -l)",
-              "if [ \\\"$RUNNING_CONTAINERS\\\" -ne 3 ]; then",
-              "  echo \\\"Deployment failed. Rolling back...\\\";",
-              "  PREV_TAG=$(aws ssm get-parameter --name \\\"/idlms/license-api/last-successful-build\\\" --query \\\"Parameter.Value\\\" --output text --region '\"$AWS_REGION\"');",
-              "  echo \\\"Rolling back to tag: $PREV_TAG\\\";",
-              "  sed -i \\\"/BUILD_TAG=/d\\\" .env; echo \\\"BUILD_TAG=$PREV_TAG\\\" >> .env;",
-              "  docker-compose --env-file .env down || true;",
-              "  docker rmi ${ECR_REPO_URL}:${TAG_TO_DEPLOY} || true;",
-              "  docker-compose --env-file .env pull --ignore-pull-failures;",
-              "  docker-compose --env-file .env up -d --force-recreate;",
-              "else",
-              "  echo \\\"All containers are up. Saving ${TAG_TO_DEPLOY} as last-successful-build...\\\";",
-              "  aws ssm put-parameter --name \\\"/idlms/license-api/last-successful-build\\\" --value \\\"$TAG_TO_DEPLOY\\\" --type String --overwrite --region '\"$AWS_REGION\"';",
-              "fi",
-              "docker ps"
-            ]' \
+            --parameters file://deploy.json \
             --timeout-seconds 900 \
             --region "$AWS_REGION"
 
