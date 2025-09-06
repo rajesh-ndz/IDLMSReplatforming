@@ -1,0 +1,33 @@
+# Terraform
+**/.terraform/*
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.crash.log
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Provider plugins & caches
+**/.terraform/providers/
+
+# Archives / binaries
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Editors/OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
