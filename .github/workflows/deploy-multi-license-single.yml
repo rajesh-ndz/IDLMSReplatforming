@@ -55,7 +55,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: 1.5.0
+          terraform_version: 1.7.5
           terraform_wrapper: false
 
       # ─────────────────── Self-healing TF reader bootstrap ───────────────────
@@ -63,11 +63,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
+          echo "Terraform version:" && terraform version
 
           ENV_NAME="${{ github.event.inputs.ENV }}"
           REGION="${{ env.AWS_REGION }}"
 
-          # Map ENV -> platform state bucket/region (adjust if you add dev/prod later)
+          # Map ENV -> platform-state bucket/region
           case "$ENV_NAME" in
             stage)
               PLATFORM_STATE_BUCKET="stage-btl-idlms-repo-backend-api-tfstate-592776312448"
@@ -101,7 +102,7 @@ jobs:
           variable "platform_state_region"  { type = string }
           TF
 
-          # main.tf — read platform-main states only
+          # main.tf
           cat > infra/platform-remote/main.tf <<'TF'
           locals {
             network_key  = "${var.env_name}/network/terraform.tfstate"
@@ -155,16 +156,14 @@ jobs:
           platform_state_region = "${PLATFORM_STATE_REGION}"
           EOF
 
-          echo "==== WROTE infra/platform-remote/${ENV_NAME}.tfvars ===="
-          cat "infra/platform-remote/${ENV_NAME}.tfvars"
-
       - name: Read platform-main outputs
         id: platform
         run: |
           set -euo pipefail
           cd infra/platform-remote
-          terraform init
-          terraform apply -auto-approve -refresh-only -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          terraform init -upgrade
+          # NOTE: plain apply (no -refresh-only) to avoid the "unsupported checkable object kind \"var\"" bug
+          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
           terraform output -json > /tmp/platform_remote.json
           ECR_REPO_URL=$(jq -r '.ecr_repository_url.value // empty' /tmp/platform_remote.json)
           TARGET_INSTANCE_ID=$(jq -r '.compute_instance_id.value // empty' /tmp/platform_remote.json)
@@ -220,11 +219,17 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.7.5
+          terraform_wrapper: false
+
       # ─────────────────── Self-healing TF reader bootstrap ───────────────────
       - name: Bootstrap platform-remote terraform + ${ENV}.tfvars
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
+          echo "Terraform version:" && terraform version
 
           ENV_NAME="${{ github.event.inputs.ENV }}"
           REGION="${{ env.AWS_REGION }}"
@@ -240,7 +245,7 @@ jobs:
 
           mkdir -p infra/platform-remote
 
-          # (same files as above — idempotent)
+          # provider/variables/main/outputs (idempotent)
           cat > infra/platform-remote/provider.tf <<'TF'
           terraform {
             required_version = ">= 1.5.0"
@@ -253,14 +258,12 @@ jobs:
           }
           provider "aws" { region = var.region }
           TF
-
           cat > infra/platform-remote/variables.tf <<'TF'
           variable "env_name"               { type = string }
           variable "region"                 { type = string }
           variable "platform_state_bucket"  { type = string }
           variable "platform_state_region"  { type = string }
           TF
-
           cat > infra/platform-remote/main.tf <<'TF'
           locals {
             network_key  = "${var.env_name}/network/terraform.tfstate"
@@ -290,7 +293,6 @@ jobs:
             config = { bucket = var.platform_state_bucket, key = local.rest_api_key, region = var.platform_state_region }
           }
           TF
-
           cat > infra/platform-remote/outputs.tf <<'TF'
           output "vpc_id"              { value = try(data.terraform_remote_state.network.outputs.vpc_id, null) }
           output "public_subnet_ids"   { value = try(data.terraform_remote_state.network.outputs.public_subnet_ids, []) }
@@ -304,7 +306,6 @@ jobs:
           output "apigw_invoke_url"    { value = try(data.terraform_remote_state.rest_api.outputs.invoke_url, null) }
           output "apigw_stage_name"    { value = try(data.terraform_remote_state.rest_api.outputs.stage_name, null) }
           TF
-
           cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
           env_name              = "${ENV_NAME}"
           region                = "${REGION}"
@@ -317,8 +318,8 @@ jobs:
         run: |
           set -euo pipefail
           cd infra/platform-remote
-          terraform init
-          terraform apply -auto-approve -refresh-only -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          terraform init -upgrade
+          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
           terraform output -json > /tmp/platform_remote.json
           ECR_REPO_URL=$(jq -r '.ecr_repository_url.value // empty' /tmp/platform_remote.json)
           TARGET_INSTANCE_ID=$(jq -r '.compute_instance_id.value // empty' /tmp/platform_remote.json)
@@ -423,13 +424,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.7.5
+          terraform_wrapper: false
+
       - name: Read platform-main outputs for instance id
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
           cd infra/platform-remote
-          terraform init
-          terraform apply -auto-approve -refresh-only -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          terraform init -upgrade
+          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
           IID=$(terraform output -raw compute_instance_id || true)
           if [ -z "$IID" ] || [ "$IID" = "null" ]; then
             echo "::error::No compute instance id found in platform-remote outputs."
