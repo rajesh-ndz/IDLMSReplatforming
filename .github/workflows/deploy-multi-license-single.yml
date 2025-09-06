@@ -36,10 +36,8 @@ jobs:
       image_uri: ${{ steps.tags.outputs.IMAGE_URI }}
       latest_uri: ${{ steps.tags.outputs.LATEST_URI }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.GIT_REF }}
+      - uses: actions/checkout@v4
+        with: { ref: ${{ github.event.inputs.GIT_REF }} }
 
       - name: Guard AWS_REGION
         run: |
@@ -48,15 +46,13 @@ jobs:
             exit 1
           fi
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
+      - uses: aws-actions/configure-aws-credentials@v3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v2
+      - uses: hashicorp/setup-terraform@v2
         with:
           terraform_version: 1.5.0
           terraform_wrapper: false
@@ -65,6 +61,7 @@ jobs:
         id: platform
         run: |
           set -euo pipefail
+          sudo apt-get update -y && sudo apt-get install -y jq
           cd infra/platform-remote
           terraform init
           terraform apply -auto-approve -refresh-only -var-file="${{ github.event.inputs.ENV }}.tfvars"
@@ -81,8 +78,7 @@ jobs:
           BACKUP_BUCKET="idlms-${{ github.event.inputs.ENV }}-built-artifact-${ACCOUNT_ID}"
           echo "BACKUP_BUCKET=$BACKUP_BUCKET" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+      - uses: aws-actions/amazon-ecr-login@v2
 
       - name: Generate build tags
         id: tags
@@ -114,13 +110,10 @@ jobs:
     if: ${{ always() }}
     environment: ${{ github.event.inputs.ENV || 'stage' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.GIT_REF }}
+      - uses: actions/checkout@v4
+        with: { ref: ${{ github.event.inputs.ENV }} }
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
+      - uses: aws-actions/configure-aws-credentials@v3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -130,6 +123,7 @@ jobs:
         id: platform
         run: |
           set -euo pipefail
+          sudo apt-get update -y && sudo apt-get install -y jq
           cd infra/platform-remote
           terraform init
           terraform apply -auto-approve -refresh-only -var-file="${{ github.event.inputs.ENV }}.tfvars"
@@ -146,13 +140,7 @@ jobs:
           BACKUP_BUCKET="idlms-${{ github.event.inputs.ENV }}-built-artifact-${ACCOUNT_ID}"
           echo "BACKUP_BUCKET=$BACKUP_BUCKET" >> "$GITHUB_ENV"
 
-      - name: Upload docker-compose.yml to S3
-        run: |
-          echo "Uploading docker-compose.yml to s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml"
-          aws s3 cp docker/docker-compose.yml "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml" --region "${{ env.AWS_REGION }}"
-
-      - name: Log in to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+      - uses: aws-actions/amazon-ecr-login@v2
 
       - name: Decide tag to deploy
         id: decide
@@ -166,6 +154,10 @@ jobs:
           fi
           echo "TAG_TO_DEPLOY=$TAG" | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
           echo "Deploying tag: $TAG"
+
+      - name: Upload docker-compose.yml to S3
+        run: |
+          aws s3 cp docker/docker-compose.yml "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml" --region "${{ env.AWS_REGION }}"
 
       - name: Deploy containers with rollback via SSM
         run: |
@@ -233,8 +225,7 @@ jobs:
             exit 1
           fi
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
+      - uses: aws-actions/configure-aws-credentials@v3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -243,6 +234,7 @@ jobs:
       - name: Read platform-main outputs for instance id
         run: |
           set -euo pipefail
+          sudo apt-get update -y && sudo apt-get install -y jq
           cd infra/platform-remote
           terraform init
           terraform apply -auto-approve -refresh-only -var-file="${{ github.event.inputs.ENV }}.tfvars"
