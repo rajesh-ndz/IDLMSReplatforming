@@ -1,8 +1,0 @@
-.gradle/
-gradle/
-build/
-.idea/
-gradle-info.log
-gradlew
-gradlew.bat
-**/index.0

@@ -1,8 +1,0 @@
-[
-  "../auth_flows/school_admin.json",
-  "../auth_flows/lasdri_admin.json",
-  "../auth_flows/lasdri_officer.json",
-  "new_driving_school_onboard_flow.json",
-  "assign_lasdri_officer.json",
-  "lasdri_officer_submit_inspection_results.json"
-]
