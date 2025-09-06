@@ -68,7 +68,6 @@ jobs:
           ENV_NAME="${{ github.event.inputs.ENV }}"
           REGION="${{ env.AWS_REGION }}"
 
-          # Map ENV -> platform-state bucket/region
           case "$ENV_NAME" in
             stage)
               PLATFORM_STATE_BUCKET="stage-btl-idlms-repo-backend-api-tfstate-592776312448"
@@ -80,7 +79,6 @@ jobs:
 
           mkdir -p infra/platform-remote
 
-          # provider.tf
           cat > infra/platform-remote/provider.tf <<'TF'
           terraform {
             required_version = ">= 1.5.0"
@@ -94,7 +92,6 @@ jobs:
           provider "aws" { region = var.region }
           TF
 
-          # variables.tf
           cat > infra/platform-remote/variables.tf <<'TF'
           variable "env_name"               { type = string }
           variable "region"                 { type = string }
@@ -102,7 +99,6 @@ jobs:
           variable "platform_state_region"  { type = string }
           TF
 
-          # main.tf
           cat > infra/platform-remote/main.tf <<'TF'
           locals {
             network_key  = "${var.env_name}/network/terraform.tfstate"
@@ -133,7 +129,6 @@ jobs:
           }
           TF
 
-          # outputs.tf
           cat > infra/platform-remote/outputs.tf <<'TF'
           output "vpc_id"              { value = try(data.terraform_remote_state.network.outputs.vpc_id, null) }
           output "public_subnet_ids"   { value = try(data.terraform_remote_state.network.outputs.public_subnet_ids, []) }
@@ -148,7 +143,6 @@ jobs:
           output "apigw_stage_name"    { value = try(data.terraform_remote_state.rest_api.outputs.stage_name, null) }
           TF
 
-          # ${ENV}.tfvars
           cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
           env_name              = "${ENV_NAME}"
           region                = "${REGION}"
@@ -162,13 +156,30 @@ jobs:
           set -euo pipefail
           cd infra/platform-remote
           terraform init -upgrade
-          # NOTE: plain apply (no -refresh-only) to avoid the "unsupported checkable object kind \"var\"" bug
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
           terraform output -json > /tmp/platform_remote.json
-          ECR_REPO_URL=$(jq -r '.ecr_repository_url.value // empty' /tmp/platform_remote.json)
+          # Try multiple common keys for ECR repo output
+          ECR_REPO_URL=$(jq -r '(.ecr_repository_url.value // .repository_url.value // .ecr_repo_url.value // empty)' /tmp/platform_remote.json)
           TARGET_INSTANCE_ID=$(jq -r '.compute_instance_id.value // empty' /tmp/platform_remote.json)
           echo "ECR_REPO_URL=$ECR_REPO_URL" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
           echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
+
+      # NEW: fallback if ecr_repository_url wasn't in TF outputs
+      - name: Discover ECR repo URL (fallback)
+        if: ${{ env.ECR_REPO_URL == '' }}
+        run: |
+          set -euo pipefail
+          AWS_REGION="${{ env.AWS_REGION }}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          # List repos and pick the most likely (prefer names containing idlms/license/api or current ENV)
+          candidates="$(aws ecr describe-repositories --region "$AWS_REGION" --query 'repositories[].repositoryName' --output text | tr '\t' '\n' || true)"
+          echo "ECR candidates:"; echo "$candidates" | sed 's/^/- /'
+          NAME="$(echo "$candidates" | grep -Ei '(^|-)stage(-|$)|idlms|license|api' | head -n1 || true)"
+          if [ -z "$NAME" ]; then
+            echo "::error::No suitable ECR repository found. Create one or ensure platform state has ECR."; exit 1
+          fi
+          URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAME}"
+          echo "ECR_REPO_URL=$URL" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
 
       - name: Compute account id & artifact bucket
         id: acct
@@ -183,7 +194,7 @@ jobs:
         id: tags
         run: |
           if [ -z "${{ env.ECR_REPO_URL }}" ]; then
-            echo "::error::ECR_REPO_URL is empty (platform-remote output missing)."
+            echo "::error::ECR_REPO_URL is empty (platform-remote output missing and discovery failed)."
             exit 1
           fi
           DATE_TAG=$(date +'%Y.%m.%d')
@@ -245,7 +256,6 @@ jobs:
 
           mkdir -p infra/platform-remote
 
-          # provider/variables/main/outputs (idempotent)
           cat > infra/platform-remote/provider.tf <<'TF'
           terraform {
             required_version = ">= 1.5.0"
@@ -321,10 +331,26 @@ jobs:
           terraform init -upgrade
           terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
           terraform output -json > /tmp/platform_remote.json
-          ECR_REPO_URL=$(jq -r '.ecr_repository_url.value // empty' /tmp/platform_remote.json)
+          ECR_REPO_URL=$(jq -r '(.ecr_repository_url.value // .repository_url.value // .ecr_repo_url.value // empty)' /tmp/platform_remote.json)
           TARGET_INSTANCE_ID=$(jq -r '.compute_instance_id.value // empty' /tmp/platform_remote.json)
           echo "ECR_REPO_URL=${ECR_REPO_URL}" >> "$GITHUB_ENV"
           echo "TARGET_INSTANCE_ID=${TARGET_INSTANCE_ID}" >> "$GITHUB_ENV"
+
+      # NEW: fallback if TF outputs didn't contain the ECR url
+      - name: Discover ECR repo URL (fallback)
+        if: ${{ env.ECR_REPO_URL == '' }}
+        run: |
+          set -euo pipefail
+          AWS_REGION="${{ env.AWS_REGION }}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          candidates="$(aws ecr describe-repositories --region "$AWS_REGION" --query 'repositories[].repositoryName' --output text | tr '\t' '\n' || true)"
+          echo "ECR candidates:"; echo "$candidates" | sed 's/^/- /'
+          NAME="$(echo "$candidates" | grep -Ei '(^|-)stage(-|$)|idlms|license|api' | head -n1 || true)"
+          if [ -z "$NAME" ]; then
+            echo "::error::No suitable ECR repository found. Create one or ensure platform state has ECR."; exit 1
+          fi
+          URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAME}"
+          echo "ECR_REPO_URL=$URL" >> "$GITHUB_ENV"
 
       - uses: aws-actions/amazon-ecr-login@v2
 
