@@ -60,7 +60,7 @@ jobs:
         uses: hashicorp/setup-terraform@v2
         with:
           terraform_version: 1.5.0
-          
+          terraform_wrapper: false
 
       # Read outputs from platform-main (via IDLMS/infra/platform-remote)
       - name: Read platform-main remote outputs
