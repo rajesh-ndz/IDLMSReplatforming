@@ -58,6 +58,30 @@ jobs:
           terraform_version: 1.5.0
           terraform_wrapper: false
 
+      - name: Ensure platform-remote varfile (${ENV}.tfvars)
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ github.event.inputs.ENV }}"
+          REGION="${{ env.AWS_REGION }}"
+          # If you want to centralize these, move them to GitHub Variables and read them here.
+          case "$ENV_NAME" in
+            stage)
+              PLATFORM_STATE_BUCKET="stage-btl-idlms-repo-backend-api-tfstate-592776312448"
+              PLATFORM_STATE_REGION="ap-south-1"
+              ;;
+            *)
+              echo "::error::No platform_state_bucket mapping for ENV=$ENV_NAME"; exit 1 ;;
+          esac
+          mkdir -p infra/platform-remote
+          cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
+env_name              = "${ENV_NAME}"
+region                = "${REGION}"
+platform_state_bucket = "${PLATFORM_STATE_BUCKET}"
+platform_state_region = "${PLATFORM_STATE_REGION}"
+EOF
+          echo "Wrote infra/platform-remote/${ENV_NAME}.tfvars:"
+          cat "infra/platform-remote/${ENV_NAME}.tfvars"
+
       - name: Read platform-main outputs
         id: platform
         run: |
@@ -120,6 +144,27 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure platform-remote varfile (${ENV}.tfvars)
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ github.event.inputs.ENV }}"
+          REGION="${{ env.AWS_REGION }}"
+          case "$ENV_NAME" in
+            stage)
+              PLATFORM_STATE_BUCKET="stage-btl-idlms-repo-backend-api-tfstate-592776312448"
+              PLATFORM_STATE_REGION="ap-south-1"
+              ;;
+            *)
+              echo "::error::No platform_state_bucket mapping for ENV=$ENV_NAME"; exit 1 ;;
+          esac
+          mkdir -p infra/platform-remote
+          cat > "infra/platform-remote/${ENV_NAME}.tfvars" <<EOF
+env_name              = "${ENV_NAME}"
+region                = "${REGION}"
+platform_state_bucket = "${PLATFORM_STATE_BUCKET}"
+platform_state_region = "${PLATFORM_STATE_REGION}"
+EOF
 
       - name: Re-read platform-main outputs
         id: platform
