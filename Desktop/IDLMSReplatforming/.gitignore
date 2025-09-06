@@ -1,9 +1,0 @@
-# Terraform build artifacts
-**/.terraform/
-*.tfstate
-*.tfstate.*
-*.tfplan
-crash.log
-
-# Keep the provider lock file tracked (best practice)
-!.terraform.lock.hcl
