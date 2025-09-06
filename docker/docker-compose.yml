@@ -36,4 +36,3 @@ services:
     environment:
       - PORT=${PORT2}
     command: node dist/main.js
-

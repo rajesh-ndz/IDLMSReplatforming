@@ -42,7 +42,6 @@ data "terraform_remote_state" "ecr" {
   }
 }
 
-# Optional (if rest-api stack is applied in platform-main)
 data "terraform_remote_state" "rest_api" {
   backend = "s3"
   config = {

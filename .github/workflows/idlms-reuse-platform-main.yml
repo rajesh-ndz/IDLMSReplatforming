@@ -1,85 +1,9 @@
-name: IDLMS Reuse Platform Main
-
-on:
-  workflow_dispatch:
-    inputs:
-      env_name:
-        description: "Environment tfvars (e.g., stage)"
-        required: true
-        default: "stage"
-  push:
-    branches: [ main ]
-
-permissions:
-  contents: read
-  id-token: write
-
+name: DEPRECATED - Use 'deploy-multi-license-single.yml'
+on: { workflow_dispatch: {} }
 jobs:
-  terraform-plan:
-    name: "Terraform plan (${{ matrix.name }})"
+  noop:
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: ecr
-            path: infra/ecr
-          - name: nlb
-            path: infra/nlb
-          - name: rest-api
-            path: infra/rest-api
-          - name: ssm
-            path: infra/ssm
-          - name: cloudwatch
-            path: infra/cloudwatch
-          - name: s3
-            path: infra/s3
-
-    env:
-      AWS_REGION: ap-south-1
-      TF_IN_AUTOMATION: "true"
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # OPTIONAL: If you use static AWS keys stored in repo secrets, uncomment:
-      # - name: Configure AWS (static keys)
-      #   run: echo "Using static keys from secrets"
-      #   env:
-      #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #     AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_wrapper: false
-
-      - name: Terraform fmt check
-        run: terraform -chdir=${{ matrix.path }} fmt -check
-
-      - name: Terraform init
-        run: terraform -chdir=${{ matrix.path }} init -reconfigure -upgrade
-
-      - name: Terraform validate
-        run: terraform -chdir=${{ matrix.path }} validate
-
-      - name: Terraform plan
-        run: |
-          ENV_INPUT="${{ github.event.inputs.env_name }}"
-          ENV_NAME="${ENV_INPUT:-stage}"
-          if [ -f "${{ matrix.path }}/${ENV_NAME}.tfvars" ]; then
-            terraform -chdir=${{ matrix.path }} plan -input=false -var-file="${ENV_NAME}.tfvars" -out=plan.out
-          else
-            echo "No ${ENV_NAME}.tfvars in ${{ matrix.path }}, running plan without tfvars"
-            terraform -chdir=${{ matrix.path }} plan -input=false -out=plan.out
-          fi
-
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: plan-${{ matrix.name }}
-          path: ${{ matrix.path }}/plan.out
-          if-no-files-found: ignore
+      - run: |
+          echo "::error::Deprecated. Use '.github/workflows/deploy-multi-license-single.yml'."
+          exit 1

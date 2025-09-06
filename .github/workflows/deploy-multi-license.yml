@@ -1,16 +1,9 @@
-name: Deploy Multi License API (reuse platform-main)
-on:
-  workflow_dispatch:
-    inputs:
-      ENV:
-        description: "Environment to deploy (dev/stage/prod)"
-        required: true
-        default: "stage"
-      ROLLBACK_TAG:
-        description: "If set, deploy that tag"
-        required: false
-      GIT_REF:
-        description: "Git ref/branch to use"
-        required: false
-        default: "main"
-# (rest of the file unchanged)
+name: DEPRECATED - Use 'deploy-multi-license-single.yml'
+on: { workflow_dispatch: {} }
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::error::Deprecated. Use '.github/workflows/deploy-multi-license-single.yml'."
+          exit 1
