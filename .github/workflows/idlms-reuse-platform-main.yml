@@ -1,11 +1,91 @@
 name: IDLMS Reuse Platform Main
+
 on:
   workflow_dispatch:
+    inputs:
+      env_name:
+        description: "Environment tfvars (e.g., stage)"
+        required: true
+        default: "stage"
   push:
     branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write    # for OIDC if you choose to use AWS role assumption
+
 jobs:
-  sanity:
+  terraform-plan:
+    name: "Terraform plan (${{ matrix.stack }})"
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        stack:
+          - infra/ecr
+          - infra/nlb
+          - infra/rest-api
+          - infra/ssm
+          - infra/cloudwatch
+          - infra/s3
+          # add/remove stacks as you need
+
+    env:
+      AWS_REGION: ap-south-1
+      TF_IN_AUTOMATION: "true"
+
     steps:
-      - uses: actions/checkout@v4
-      - run: echo "Workflow alive ✅"
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Choose ONE of the following auth methods:
+
+      # (A) OIDC to assume a role (recommended)
+      # - name: Configure AWS credentials via OIDC
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      # (B) Static keys from secrets (fallback)
+      - name: Configure AWS with static keys
+        if: ${{ !env.AWS_ACCESS_KEY_ID }}
+        run: |
+          test -n "${{ secrets.AWS_ACCESS_KEY_ID }}" && echo "Using static keys" || echo "No static keys set"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        run: terraform -chdir=${{ matrix.stack }} fmt -check
+
+      - name: Terraform init
+        run: terraform -chdir=${{ matrix.stack }} init -reconfigure -upgrade
+
+      - name: Terraform validate
+        run: terraform -chdir=${{ matrix.stack }} validate
+
+      - name: Terraform plan
+        run: |
+          ENV_INPUT="${{ github.event.inputs.env_name }}"
+          ENV_NAME="${ENV_INPUT:-stage}"
+          if [ -f "${{ matrix.stack }}/${ENV_NAME}.tfvars" ]; then
+            terraform -chdir=${{ matrix.stack }} plan -input=false -var-file="${ENV_NAME}.tfvars" -out=plan.out
+          else
+            echo "No ${ENV_NAME}.tfvars in ${{ matrix.stack }}, running plan without tfvars"
+            terraform -chdir=${{ matrix.stack }} plan -input=false -out=plan.out
+          fi
+
+      - name: Upload plan as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ matrix.stack##*/ }}
+          path: ${{ matrix.stack }}/plan.out
+          if-no-files-found: ignore
