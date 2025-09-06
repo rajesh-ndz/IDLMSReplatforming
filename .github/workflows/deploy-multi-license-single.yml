@@ -37,7 +37,8 @@ jobs:
       latest_uri: ${{ steps.tags.outputs.LATEST_URI }}
     steps:
       - uses: actions/checkout@v4
-        with: { ref: ${{ github.event.inputs.GIT_REF }} }
+        with:
+          ref: ${{ github.event.inputs.GIT_REF }}
 
       - name: Guard AWS_REGION
         run: |
@@ -111,7 +112,8 @@ jobs:
     environment: ${{ github.event.inputs.ENV || 'stage' }}
     steps:
       - uses: actions/checkout@v4
-        with: { ref: ${{ github.event.inputs.ENV }} }
+        with:
+          ref: ${{ github.event.inputs.GIT_REF }}
 
       - uses: aws-actions/configure-aws-credentials@v3
         with:
@@ -133,14 +135,14 @@ jobs:
           echo "ECR_REPO_URL=${ECR_REPO_URL}" >> "$GITHUB_ENV"
           echo "TARGET_INSTANCE_ID=${TARGET_INSTANCE_ID}" >> "$GITHUB_ENV"
 
+      - uses: aws-actions/amazon-ecr-login@v2
+
       - name: Compute account id & artifact bucket
         id: acct
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           BACKUP_BUCKET="idlms-${{ github.event.inputs.ENV }}-built-artifact-${ACCOUNT_ID}"
           echo "BACKUP_BUCKET=$BACKUP_BUCKET" >> "$GITHUB_ENV"
-
-      - uses: aws-actions/amazon-ecr-login@v2
 
       - name: Decide tag to deploy
         id: decide
