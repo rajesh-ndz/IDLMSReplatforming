@@ -125,6 +125,9 @@ jobs:
     needs: [build_image]
     if: ${{ always() }}
     environment: ${{ github.event.inputs.ENV }}
+    outputs:
+      tag_to_deploy: ${{ steps.decide.outputs.TAG_TO_DEPLOY }}
+      ecr_repo_url: ${{ steps.ecr_url.outputs.ECR_REPO_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -201,6 +204,7 @@ jobs:
           fi
           [ -z "$URL" ] && { echo "::error::ECR repository URL not found. Ensure build_image ran successfully at least once."; exit 1; }
           echo "ECR_REPO_URL=$URL" >> "$GITHUB_ENV"
+          echo "ECR_REPO_URL=$URL" >> "$GITHUB_OUTPUT"
           echo "Using ECR: $URL"
 
       - name: Log in to Amazon ECR
@@ -221,7 +225,7 @@ jobs:
           echo "TAG_TO_DEPLOY=$TAG" | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
           echo "Deploying tag: $TAG"
 
-      - name: Deploy containers via SSM (atomic, rollback, record last-good)
+      - name: Deploy containers via SSM (atomic, rollback, record last-good) + logs
         shell: bash
         run: |
           set -euo pipefail
@@ -231,59 +235,57 @@ jobs:
           REGION="${{ env.AWS_REGION }}"
           INSTANCE="${{ env.INSTANCE_ID }}"
 
-          # Compose file from repo (always present on box)
+          if [ -z "$IMAGE_REPO" ]; then
+            echo "::error::ECR_REPO_URL not set"; exit 1
+          fi
+
+          # Ensure compose file exists in repo; embed it for the instance
           if [ ! -f docker/docker-compose.yml ]; then
             echo "::error::docker/docker-compose.yml not found in repo"
             exit 1
           fi
           COMPOSE_B64="$(base64 -w 0 docker/docker-compose.yml)"
 
-          # Build SSM JSON with single-quoted heredoc: no local expansion
+          # No local expansion; placeholders replaced below
           cat > ssm-deploy.json <<'JSON'
           {
             "commands": [
               "set -euo pipefail",
               "cd /home/ubuntu",
 
-              "# Write compose file",
               "echo \"__COMPOSE_B64__\" | base64 -d > docker-compose.yml",
               "chown ubuntu:ubuntu docker-compose.yml || true",
 
-              "# Fetch env from SSM, then enforce IMAGE_REPO/BUILD_TAG",
               "ENV_NAME=__ENV_NAME__",
               "TAG=__TAG__",
               "IMAGE_REPO=__IMAGE_REPO__",
               "REGION=__REGION__",
+
               "PARAM=\"/idlms/shared/${ENV_NAME}/.env\"",
               "ENV_CONTENT=$(aws ssm get-parameter --name \"$PARAM\" --with-decryption --query \"Parameter.Value\" --output text || echo '')",
               "printf \"%s\" \"$ENV_CONTENT\" > .env",
               "grep -q '^IMAGE_REPO=' .env && sed -i 's|^IMAGE_REPO=.*|IMAGE_REPO='\"${IMAGE_REPO}\"'|' .env || echo \"IMAGE_REPO=${IMAGE_REPO}\" >> .env",
               "grep -q '^BUILD_TAG=' .env && sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${TAG}\"'|' .env || echo \"BUILD_TAG=${TAG}\" >> .env",
 
-              "# Determine docker compose driver",
               "if docker compose version >/dev/null 2>&1; then DC='docker compose'; elif command -v docker-compose >/dev/null 2>&1; then DC='docker-compose'; else curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; DC='docker-compose'; fi",
 
-              "# ECR login (host only)",
               "ECR_HOST=${IMAGE_REPO%%/*}",
               "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_HOST}",
 
-              "# Function to deploy a given tag",
               "deploy_tag() {",
               "  local tag=\"$1\"",
               "  sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${tag}\"'|' .env || true",
-              "  echo '--- docker-compose config ---'",
+              "  echo '--- docker compose config ---'",
               "  ${DC} --env-file .env config || true",
-              "  echo '--- docker-compose pull ---'",
+              "  echo '--- docker compose pull ---'",
               "  ${DC} --env-file .env pull --ignore-pull-failures || true",
-              "  echo '--- docker-compose up -d ---'",
+              "  echo '--- docker compose up -d ---'",
               "  ${DC} --env-file .env up -d --force-recreate || true",
               "  sleep 25",
-              "  # verify three containers present and Up",
-              "  CNT=$(docker ps --format '{{.Names}} {{.Status}}' | awk '$2 ~ /^Up/ && ($1==\"api1\"||$1==\"api2\"||$1==\"api3\") {c++} END{print c+0}')",
-              "  if [ \"$CNT\" -eq 3 ]; then return 0; else return 1; fi",
+              "  CNT=$(docker ps --format '{{.Image}} {{.Status}}' | awk -v img=\"${IMAGE_REPO}:${tag}\" '$1==img && $2 ~ /^Up/ {c++} END{print c+0}')",
+              "  if [ \"$CNT\" -ge 1 ]; then return 0; else return 1; fi",
               "}",
 
-              "# Try desired tag",
               "if deploy_tag \"${TAG}\"; then",
               "  echo \"Deployment OK for ${TAG}. Recording last-successful-build...\"",
               "  aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \"${TAG}\" --type String --overwrite --region ${REGION}",
@@ -293,32 +295,23 @@ jobs:
               "echo 'Deployment failed. Attempting rollback to previous successful tag...' >&2",
               "PREV=$(aws ssm get-parameter --name \"/idlms/license-api/last-successful-build\" --query \"Parameter.Value\" --output text --region ${REGION} 2>/dev/null || echo '')",
               "if [ -n \"$PREV\" ] && [ \"$PREV\" != \"None\" ]; then",
-              "  if deploy_tag \"$PREV\"; then",
-              "    echo \"Rollback succeeded to ${PREV}\"",
-              "    exit 0",
-              "  else",
-              "    echo \"Rollback to ${PREV} failed\" >&2",
-              "  fi",
-              "else",
-              "  echo 'No previous successful tag found for rollback' >&2",
+              "  if deploy_tag \"$PREV\"; then echo \"Rollback succeeded to ${PREV}\"; exit 0; fi",
               "fi",
 
               "echo '------ diagnostics: docker ps -a ------'",
               "docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}'",
-              "for c in api1 api2 api3; do echo \"========== logs: $c ==========\"; docker logs --tail 200 \"$c\" || true; done",
+              "for c in $(docker ps -a --format '{{.Names}}'); do echo \"========== logs: $c ==========\"; docker logs --tail 200 \"$c\" || true; done",
               "exit 1"
             ]
           }
           JSON
 
-          # Inject values
           sed -i "s|__ENV_NAME__|${ENV_NAME}|g" ssm-deploy.json
           sed -i "s|__TAG__|${TAG}|g" ssm-deploy.json
           sed -i "s|__IMAGE_REPO__|${IMAGE_REPO}|g" ssm-deploy.json
           sed -i "s|__REGION__|${REGION}|g" ssm-deploy.json
           sed -i "s|__COMPOSE_B64__|${COMPOSE_B64}|g" ssm-deploy.json
 
-          # Execute on the instance
           CMD_ID="$(aws ssm send-command \
             --document-name 'AWS-RunShellScript' \
             --instance-ids "${INSTANCE}" \
@@ -327,7 +320,18 @@ jobs:
             --query 'Command.CommandId' \
             --output text \
             --region "${REGION}")"
-          echo "SSM Command: $CMD_ID"
+
+          # Poll and print logs so failures are obvious
+          while true; do
+            STATUS="$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text --region "$REGION")"
+            case "$STATUS" in Pending|InProgress|Delayed) sleep 5 ;; Success|Cancelled|TimedOut|Failed) break ;; *) sleep 5 ;; esac
+          done
+          echo "SSM status: $STATUS"
+          echo "----- STDOUT -----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --region "$REGION" --query 'StandardOutputContent' --output text || true
+          echo "----- STDERR -----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --region "$REGION" --query 'StandardErrorContent'  --output text || true
+          [ "$STATUS" = "Success" ] || { echo "::error::deploy failed"; exit 1; }
 
   verify:
     name: Post-deploy health check
@@ -343,48 +347,53 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Wait 45 seconds for containers to settle
+      - name: Wait 30 seconds for containers to settle
         shell: bash
-        run: sleep 45
+        run: sleep 30
 
-      - name: Health check via SSM
+      - name: Health check via SSM (match image:tag)
         shell: bash
         run: |
           set -euo pipefail
           ENV_INPUT="${{ github.event.inputs.ENV }}"
-          AWS_REGION="${{ env.AWS_REGION }}"
+          REGION="${{ env.AWS_REGION }}"
+          REPO="${{ needs.deploy.outputs.ecr_repo_url }}"
+          TAG="${{ needs.deploy.outputs.tag_to_deploy }}"
+
+          if [ -z "$REPO" ] || [ -z "$TAG" ]; then
+            echo "::error::Missing repo/tag from deploy outputs"; exit 1
+          fi
+
           INSTANCE_ID="$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV_INPUT}" "Name=instance-state-name,Values=running" \
             --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
-            --region "$AWS_REGION" --output text || true)"
+            --region "$REGION" --output text || true)"
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
             INSTANCE_ID="$(aws ec2 describe-instances \
               --filters "Name=tag:Name,Values=${ENV_INPUT}-idlms-app" "Name=instance-state-name,Values=running" \
               --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
-              --region "$AWS_REGION" --output text || true)"
+              --region "$REGION" --output text || true)"
           fi
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "::error::pods not up"
-            exit 1
+            echo "::error::pods not up"; exit 1
           fi
 
           cat > ssm-check.json <<'JSON'
           {
             "commands": [
               "set -euo pipefail",
-              "NAMES='api1 api2 api3'",
-              "OK=0",
-              "for n in $NAMES; do",
-              "  if docker ps --format '{{.Names}} {{.Status}}' | awk -v c=$n '$1==c && $2 ~ /^Up/ {ok=1} END{exit !ok}'; then",
-              "    echo \"$n: Up\"; OK=$((OK+1));",
-              "  else",
-              "    echo \"$n: not running\"; fi",
-              "done",
-              "if [ \"$OK\" -lt 1 ]; then echo 'pods not up'; exit 1; fi",
-              "echo 'pods up'"
+              "REPO='__REPO__'",
+              "TAG='__TAG__'",
+              "CNT=$(docker ps --format '{{.Image}} {{.Status}}' | awk -v img=\"${REPO}:${TAG}\" '$1==img && $2 ~ /^Up/ {c++} END{print c+0}')",
+              "if [ \"$CNT\" -ge 1 ]; then echo 'pods up'; exit 0; fi",
+              "echo 'pods not up';",
+              "docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}'",
+              "exit 1"
             ]
           }
           JSON
+          sed -i "s|__REPO__|${REPO}|g" ssm-check.json
+          sed -i "s|__TAG__|${TAG}|g" ssm-check.json
 
           CMD_ID="$(aws ssm send-command \
             --document-name 'AWS-RunShellScript' \
@@ -393,16 +402,12 @@ jobs:
             --parameters file://ssm-check.json \
             --query 'Command.CommandId' \
             --output text \
-            --region "$AWS_REGION")"
+            --region "$REGION")"
 
           while true; do
-            STATUS="$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text --region "$AWS_REGION")"
-            case "$STATUS" in
-              Pending|InProgress|Delayed) sleep 5 ;;
-              Success|Cancelled|TimedOut|Failed) break ;;
-              *) sleep 5 ;;
-            esac
+            STATUS="$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text --region "$REGION")"
+            case "$STATUS" in Pending|InProgress|Delayed) sleep 5 ;; Success|Cancelled|TimedOut|Failed) break ;; *) sleep 5 ;; esac
           done
           echo "SSM status: $STATUS"
-          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text || true
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query 'StandardOutputContent' --output text || true
           [ "$STATUS" = "Success" ] || { echo "::error::pods not up"; exit 1; }
