@@ -177,17 +177,12 @@ jobs:
 
           mkdir -p /tmp/idlms_state
           fetch "${ENV_IN}/compute/terraform.tfstate"  /tmp/idlms_state/compute.json
-          fetch "${ENV_IN}/nlb/terraform.tfstate"      /tmp/idlms_state/nlb.json
-          fetch "${ENV_IN}/rest-api/terraform.tfstate" /tmp/idlms_state/rest.json
-          fetch "${ENV_IN}/network/terraform.tfstate"  /tmp/idlms_state/network.json
-
           INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty' /tmp/idlms_state/compute.json 2>/dev/null || true)"
           [ -z "$INSTANCE_ID" ] && { echo "::error::INSTANCE_ID not found in platform state"; exit 1; }
           echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
 
-      # Re-detect TF backend region for this repo (so we can read infra/ecr tfstate in this job)
       - name: Detect TF backend region (for TF_BUCKET)
-        id: detect_tf_backend
+        id: detect_tf_backend_deploy
         shell: bash
         run: |
           set -euo pipefail
@@ -232,7 +227,8 @@ jobs:
           echo "TAG_TO_DEPLOY=$TAG" | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
           echo "Deploying tag: $TAG"
 
-      - name: Deploy containers via SSM (safe heredoc)
+      # NEW: embed docker-compose.yml and write it on the instance
+      - name: Deploy containers via SSM (writes compose file)
         shell: bash
         run: |
           set -euo pipefail
@@ -242,7 +238,14 @@ jobs:
           REGION="${{ env.AWS_REGION }}"
           INSTANCE="${{ env.INSTANCE_ID }}"
 
-          # Build SSM JSON with single-quoted heredoc (no local expansion)
+          # Base64 the compose file from the repo
+          if [ ! -f docker/docker-compose.yml ]; then
+            echo "::error::docker/docker-compose.yml not found in repo"
+            exit 1
+          fi
+          COMPOSE_B64="$(base64 -w 0 docker/docker-compose.yml)"
+
+          # Build SSM JSON with single-quoted heredoc so variables don't expand locally
           cat > ssm-deploy.json <<'JSON'
           {
             "commands": [
@@ -252,6 +255,8 @@ jobs:
               "TAG=__TAG__",
               "IMAGE_REPO=__IMAGE_REPO__",
               "REGION=__REGION__",
+              "echo \"__COMPOSE_B64__\" | base64 -d > docker-compose.yml",
+              "chown ubuntu:ubuntu docker-compose.yml || true",
               "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV_NAME}/.env\" --with-decryption --query \"Parameter.Value\" --output text)",
               "printf \"%s\" \"$ENV_CONTENT\" > .env",
               "echo \"BUILD_TAG=${TAG}\" >> .env",
@@ -267,11 +272,12 @@ jobs:
           }
           JSON
 
-          # Inject the real values
+          # Inject values
           sed -i "s|__ENV_NAME__|${ENV_NAME}|g" ssm-deploy.json
           sed -i "s|__TAG__|${TAG}|g" ssm-deploy.json
           sed -i "s|__IMAGE_REPO__|${IMAGE_REPO}|g" ssm-deploy.json
           sed -i "s|__REGION__|${REGION}|g" ssm-deploy.json
+          sed -i "s|__COMPOSE_B64__|${COMPOSE_B64}|g" ssm-deploy.json
 
           # Send to instance
           CMD_ID="$(aws ssm send-command \
