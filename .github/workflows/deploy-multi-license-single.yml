@@ -164,7 +164,6 @@ jobs:
           [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
           echo "PLATFORM_STATE_REGION=$LOC" >> "$GITHUB_ENV"
 
-      # ⬇⬇⬇ REPLACEMENT STEP: read tfstate JSONs directly from S3 (no terraform apply) ⬇⬇⬇
       - name: Read platform-main outputs (direct from S3 tfstate)
         shell: bash
         run: |
@@ -177,24 +176,43 @@ jobs:
             aws s3api get-object --bucket "$B" --key "$key" "$out" --region "$R" >/dev/null 2>&1 || true; }
 
           mkdir -p /tmp/idlms_state
-          fetch "${ENV_IN}/compute/terraform.tfstate" /tmp/idlms_state/compute.json
-          fetch "${ENV_IN}/nlb/terraform.tfstate"     /tmp/idlms_state/nlb.json
+          fetch "${ENV_IN}/compute/terraform.tfstate"  /tmp/idlms_state/compute.json
+          fetch "${ENV_IN}/nlb/terraform.tfstate"      /tmp/idlms_state/nlb.json
           fetch "${ENV_IN}/rest-api/terraform.tfstate" /tmp/idlms_state/rest.json
           fetch "${ENV_IN}/network/terraform.tfstate"  /tmp/idlms_state/network.json
 
-          INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty'         /tmp/idlms_state/compute.json 2>/dev/null || true)"
-          LB_DNS="$(jq -r '.outputs.lb_dns_name.value // empty'              /tmp/idlms_state/nlb.json     2>/dev/null || true)"
-          APIGW_URL="$(jq -r '.outputs.invoke_url.value // empty'            /tmp/idlms_state/rest.json    2>/dev/null || true)"
-          VPC_ID="$(jq -r '.outputs.vpc_id.value // empty'                   /tmp/idlms_state/network.json 2>/dev/null || true)"
-
+          INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty' /tmp/idlms_state/compute.json 2>/dev/null || true)"
           [ -z "$INSTANCE_ID" ] && { echo "::error::INSTANCE_ID not found in platform state"; exit 1; }
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
 
-          {
-            echo "INSTANCE_ID=$INSTANCE_ID"
-            echo "NLB_DNS=$LB_DNS"
-            echo "APIGW_INVOKE_URL=$APIGW_URL"
-            echo "VPC_ID=$VPC_ID"
-          } >> "$GITHUB_ENV"
+      # Re-detect TF backend region for this repo (so we can read infra/ecr tfstate in this job)
+      - name: Detect TF backend region (for TF_BUCKET)
+        id: detect_tf_backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOC="$(aws s3api get-bucket-location --bucket "${TF_BUCKET}" --query 'LocationConstraint' --output text || true)"
+          case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
+          [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::TF bucket region not found"; exit 1; }
+          echo "TF_BACKEND_REGION=$LOC" >> "$GITHUB_ENV"
+
+      - name: Resolve ECR repository URL (from this repo's ecr tfstate)
+        id: ecr_url
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV_IN="${{ github.event.inputs.ENV }}"
+          KEY="${ENV_IN}/ecr/terraform.tfstate"
+          TMP="/tmp/ecr.tfstate.json"
+          if aws s3api head-object --bucket "${TF_BUCKET}" --key "$KEY" --region "${TF_BACKEND_REGION}" >/dev/null 2>&1; then
+            aws s3api get-object --bucket "${TF_BUCKET}" --key "$KEY" "$TMP" --region "${TF_BACKEND_REGION}" >/dev/null
+            URL="$(jq -r '.outputs.ecr_repository_url.value // empty' "$TMP" || true)"
+          else
+            URL=""
+          fi
+          [ -z "$URL" ] && { echo "::error::ECR repository URL not found. Ensure build_image ran successfully at least once."; exit 1; }
+          echo "ECR_REPO_URL=$URL" >> "$GITHUB_ENV"
+          echo "Using ECR: $URL"
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -212,29 +230,35 @@ jobs:
             TAG="latest"
           fi
           echo "TAG_TO_DEPLOY=$TAG" | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
+          echo "Deploying tag: $TAG"
 
-      - name: Deploy containers via SSM
+      - name: Deploy containers via SSM (safe heredoc)
         shell: bash
         run: |
           set -euo pipefail
-          TAG_TO_DEPLOY="${{ steps.decide.outputs.TAG_TO_DEPLOY }}"
-          ENV_INPUT="${{ github.event.inputs.ENV }}"
-          ECR_REPO_URL="${{ env.ECR_REPO_URL }}"
-          AWS_REGION="${{ env.AWS_REGION }}"
-          INSTANCE_ID="${{ env.INSTANCE_ID }}"
+          TAG="${{ steps.decide.outputs.TAG_TO_DEPLOY }}"
+          ENV_NAME="${{ github.event.inputs.ENV }}"
+          IMAGE_REPO="${{ env.ECR_REPO_URL }}"
+          REGION="${{ env.AWS_REGION }}"
+          INSTANCE="${{ env.INSTANCE_ID }}"
 
-          cat > ssm-deploy.json <<JSON
+          # Build SSM JSON with single-quoted heredoc (no local expansion)
+          cat > ssm-deploy.json <<'JSON'
           {
             "commands": [
               "set -e",
               "cd /home/ubuntu",
-              "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV_INPUT}/.env\" --with-decryption --query \"Parameter.Value\" --output text)",
+              "ENV_NAME=__ENV_NAME__",
+              "TAG=__TAG__",
+              "IMAGE_REPO=__IMAGE_REPO__",
+              "REGION=__REGION__",
+              "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV_NAME}/.env\" --with-decryption --query \"Parameter.Value\" --output text)",
               "printf \"%s\" \"$ENV_CONTENT\" > .env",
-              "echo \"BUILD_TAG=${TAG_TO_DEPLOY}\" >> .env",
-              "echo \"IMAGE_REPO=${ECR_REPO_URL}\" >> .env",
-              "if ! command -v docker &> /dev/null; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
-              "if ! command -v docker-compose &> /dev/null; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
-              "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO_URL%/*}",
+              "echo \"BUILD_TAG=${TAG}\" >> .env",
+              "echo \"IMAGE_REPO=${IMAGE_REPO}\" >> .env",
+              "if ! command -v docker >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
+              "if ! command -v docker-compose >/dev/null 2>&1; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
+              "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${IMAGE_REPO%/*}",
               "docker-compose --env-file .env down || true",
               "docker-compose --env-file .env pull --ignore-pull-failures",
               "docker-compose --env-file .env up -d --force-recreate",
@@ -243,14 +267,21 @@ jobs:
           }
           JSON
 
+          # Inject the real values
+          sed -i "s|__ENV_NAME__|${ENV_NAME}|g" ssm-deploy.json
+          sed -i "s|__TAG__|${TAG}|g" ssm-deploy.json
+          sed -i "s|__IMAGE_REPO__|${IMAGE_REPO}|g" ssm-deploy.json
+          sed -i "s|__REGION__|${REGION}|g" ssm-deploy.json
+
+          # Send to instance
           CMD_ID="$(aws ssm send-command \
             --document-name 'AWS-RunShellScript' \
-            --instance-ids "$INSTANCE_ID" \
-            --comment "Deploy containers ${ENV_INPUT} tag=${TAG_TO_DEPLOY}" \
+            --instance-ids "${INSTANCE}" \
+            --comment "Deploy containers ${ENV_NAME} tag=${TAG}" \
             --parameters file://ssm-deploy.json \
             --query 'Command.CommandId' \
             --output text \
-            --region "$AWS_REGION")"
+            --region "${REGION}")"
           echo "SSM Command: $CMD_ID"
 
   # ───────────────── Verify ─────────────────
@@ -297,7 +328,7 @@ jobs:
           {
             "commands": [
               "set -e",
-              "if ! command -v docker >/dev/null 2.>/dev/null; then echo 'pods not up'; exit 1; fi",
+              "if ! command -v docker >/dev/null 2>/dev/null; then echo 'pods not up'; exit 1; fi",
               "CNT=$(docker ps --format '{{.Names}} {{.Status}}' | awk '$2 ~ /^Up/ {c++} END{print c+0}')",
               "if [ \"$CNT\" -ge 1 ]; then echo 'pods up'; else echo 'pods not up'; exit 1; fi"
             ]
