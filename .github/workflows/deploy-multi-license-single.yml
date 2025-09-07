@@ -16,7 +16,7 @@ on:
         default: "main"
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}   # app region (e.g., ap-south-1)
+  AWS_REGION: ${{ vars.AWS_REGION }}   # e.g. ap-south-1
   TF_BUCKET: test-s3-idlmreplatforming-tfstate
 
 permissions:
@@ -28,7 +28,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ───────────────── Build Image (when not rolling back) ─────────────────
   build_image:
     if: ${{ !github.event.inputs.ROLLBACK_TAG }}
     runs-on: ubuntu-latest
@@ -121,7 +120,6 @@ jobs:
           docker push "$IMAGE_URI"
           docker push "$LATEST_URI"
 
-  # ───────────────── Deploy (reads platform-main tfstate via S3) ─────────────────
   deploy:
     runs-on: ubuntu-latest
     needs: [build_image]
@@ -164,20 +162,16 @@ jobs:
           [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
           echo "PLATFORM_STATE_REGION=$LOC" >> "$GITHUB_ENV"
 
-      - name: Read platform-main outputs (direct from S3 tfstate)
+      - name: Read INSTANCE_ID from platform tfstate
         shell: bash
         run: |
           set -euo pipefail
           ENV_IN="${{ github.event.inputs.ENV }}"
           B="$PLATFORM_STATE_BUCKET"
           R="$PLATFORM_STATE_REGION"
-
-          fetch() { local key="$1"; local out="$2";
-            aws s3api get-object --bucket "$B" --key "$key" "$out" --region "$R" >/dev/null 2>&1 || true; }
-
           mkdir -p /tmp/idlms_state
-          fetch "${ENV_IN}/compute/terraform.tfstate"  /tmp/idlms_state/compute.json
-          INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty' /tmp/idlms_state/compute.json 2>/dev/null || true)"
+          aws s3api get-object --bucket "$B" --key "${ENV_IN}/compute/terraform.tfstate" /tmp/idlms_state/compute.json --region "$R" >/dev/null
+          INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty' /tmp/idlms_state/compute.json)"
           [ -z "$INSTANCE_ID" ] && { echo "::error::INSTANCE_ID not found in platform state"; exit 1; }
           echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
 
@@ -227,8 +221,7 @@ jobs:
           echo "TAG_TO_DEPLOY=$TAG" | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
           echo "Deploying tag: $TAG"
 
-      # NEW: embed docker-compose.yml and write it on the instance
-      - name: Deploy containers via SSM (writes compose file)
+      - name: Deploy containers via SSM (atomic, rollback, record last-good)
         shell: bash
         run: |
           set -euo pipefail
@@ -238,36 +231,82 @@ jobs:
           REGION="${{ env.AWS_REGION }}"
           INSTANCE="${{ env.INSTANCE_ID }}"
 
-          # Base64 the compose file from the repo
+          # Compose file from repo (always present on box)
           if [ ! -f docker/docker-compose.yml ]; then
             echo "::error::docker/docker-compose.yml not found in repo"
             exit 1
           fi
           COMPOSE_B64="$(base64 -w 0 docker/docker-compose.yml)"
 
-          # Build SSM JSON with single-quoted heredoc so variables don't expand locally
+          # Build SSM JSON with single-quoted heredoc: no local expansion
           cat > ssm-deploy.json <<'JSON'
           {
             "commands": [
-              "set -e",
+              "set -euo pipefail",
               "cd /home/ubuntu",
+
+              "# Write compose file",
+              "echo \"__COMPOSE_B64__\" | base64 -d > docker-compose.yml",
+              "chown ubuntu:ubuntu docker-compose.yml || true",
+
+              "# Fetch env from SSM, then enforce IMAGE_REPO/BUILD_TAG",
               "ENV_NAME=__ENV_NAME__",
               "TAG=__TAG__",
               "IMAGE_REPO=__IMAGE_REPO__",
               "REGION=__REGION__",
-              "echo \"__COMPOSE_B64__\" | base64 -d > docker-compose.yml",
-              "chown ubuntu:ubuntu docker-compose.yml || true",
-              "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV_NAME}/.env\" --with-decryption --query \"Parameter.Value\" --output text)",
+              "PARAM=\"/idlms/shared/${ENV_NAME}/.env\"",
+              "ENV_CONTENT=$(aws ssm get-parameter --name \"$PARAM\" --with-decryption --query \"Parameter.Value\" --output text || echo '')",
               "printf \"%s\" \"$ENV_CONTENT\" > .env",
-              "echo \"BUILD_TAG=${TAG}\" >> .env",
-              "echo \"IMAGE_REPO=${IMAGE_REPO}\" >> .env",
-              "if ! command -v docker >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
-              "if ! command -v docker-compose >/dev/null 2>&1; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
-              "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${IMAGE_REPO%/*}",
-              "docker-compose --env-file .env down || true",
-              "docker-compose --env-file .env pull --ignore-pull-failures",
-              "docker-compose --env-file .env up -d --force-recreate",
-              "sleep 30"
+              "grep -q '^IMAGE_REPO=' .env && sed -i 's|^IMAGE_REPO=.*|IMAGE_REPO='\"${IMAGE_REPO}\"'|' .env || echo \"IMAGE_REPO=${IMAGE_REPO}\" >> .env",
+              "grep -q '^BUILD_TAG=' .env && sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${TAG}\"'|' .env || echo \"BUILD_TAG=${TAG}\" >> .env",
+
+              "# Determine docker compose driver",
+              "if docker compose version >/dev/null 2>&1; then DC='docker compose'; elif command -v docker-compose >/dev/null 2>&1; then DC='docker-compose'; else curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; DC='docker-compose'; fi",
+
+              "# ECR login (host only)",
+              "ECR_HOST=${IMAGE_REPO%%/*}",
+              "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_HOST}",
+
+              "# Function to deploy a given tag",
+              "deploy_tag() {",
+              "  local tag=\"$1\"",
+              "  sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${tag}\"'|' .env || true",
+              "  echo '--- docker-compose config ---'",
+              "  ${DC} --env-file .env config || true",
+              "  echo '--- docker-compose pull ---'",
+              "  ${DC} --env-file .env pull --ignore-pull-failures || true",
+              "  echo '--- docker-compose up -d ---'",
+              "  ${DC} --env-file .env up -d --force-recreate || true",
+              "  sleep 25",
+              "  # verify three containers present and Up",
+              "  CNT=$(docker ps --format '{{.Names}} {{.Status}}' | awk '$2 ~ /^Up/ && ($1==\"api1\"||$1==\"api2\"||$1==\"api3\") {c++} END{print c+0}')",
+              "  if [ \"$CNT\" -eq 3 ]; then return 0; else return 1; fi",
+              "}",
+
+              "# Try desired tag",
+              "if deploy_tag \"${TAG}\"; then",
+              "  echo \"Deployment OK for ${TAG}. Recording last-successful-build...\"",
+              "  aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \"${TAG}\" --type String --overwrite --region ${REGION}",
+              "  exit 0",
+              "fi",
+
+              "echo 'Deployment failed. Attempting rollback to previous successful tag...' >&2",
+              "PREV=$(aws ssm get-parameter --name \"/idlms/license-api/last-successful-build\" --query \"Parameter.Value\" --output text --region ${REGION} 2>/dev/null || echo '')",
+              "if [ -n \"$PREV\" ] && [ \"$PREV\" != \"None\" ]; then",
+              "  if deploy_tag \"$PREV\"; then",
+              "    echo \"Rollback succeeded to ${PREV}\"",
+              "    exit 0",
+              "  else",
+              "    echo \"Rollback to ${PREV} failed\" >&2",
+              "  fi",
+              "else",
+              "  echo 'No previous successful tag found for rollback' >&2",
+              "fi",
+
+              "echo '------ diagnostics: docker ps -a ------'",
+              "docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}'",
+              "for c in api1 api2 api3; do echo \"========== logs: $c ==========\"; docker logs --tail 200 \"$c\" || true; done",
+              "exit 1"
             ]
           }
           JSON
@@ -279,7 +318,7 @@ jobs:
           sed -i "s|__REGION__|${REGION}|g" ssm-deploy.json
           sed -i "s|__COMPOSE_B64__|${COMPOSE_B64}|g" ssm-deploy.json
 
-          # Send to instance
+          # Execute on the instance
           CMD_ID="$(aws ssm send-command \
             --document-name 'AWS-RunShellScript' \
             --instance-ids "${INSTANCE}" \
@@ -290,7 +329,6 @@ jobs:
             --region "${REGION}")"
           echo "SSM Command: $CMD_ID"
 
-  # ───────────────── Verify ─────────────────
   verify:
     name: Post-deploy health check
     runs-on: ubuntu-latest
@@ -333,10 +371,17 @@ jobs:
           cat > ssm-check.json <<'JSON'
           {
             "commands": [
-              "set -e",
-              "if ! command -v docker >/dev/null 2>/dev/null; then echo 'pods not up'; exit 1; fi",
-              "CNT=$(docker ps --format '{{.Names}} {{.Status}}' | awk '$2 ~ /^Up/ {c++} END{print c+0}')",
-              "if [ \"$CNT\" -ge 1 ]; then echo 'pods up'; else echo 'pods not up'; exit 1; fi"
+              "set -euo pipefail",
+              "NAMES='api1 api2 api3'",
+              "OK=0",
+              "for n in $NAMES; do",
+              "  if docker ps --format '{{.Names}} {{.Status}}' | awk -v c=$n '$1==c && $2 ~ /^Up/ {ok=1} END{exit !ok}'; then",
+              "    echo \"$n: Up\"; OK=$((OK+1));",
+              "  else",
+              "    echo \"$n: not running\"; fi",
+              "done",
+              "if [ \"$OK\" -lt 1 ]; then echo 'pods not up'; exit 1; fi",
+              "echo 'pods up'"
             ]
           }
           JSON
@@ -360,4 +405,4 @@ jobs:
           done
           echo "SSM status: $STATUS"
           aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text || true
-          if [ "$STATUS" != "Success" ]; then echo "::error::pods not up"; exit 1; fi
+          [ "$STATUS" = "Success" ] || { echo "::error::pods not up"; exit 1; }
