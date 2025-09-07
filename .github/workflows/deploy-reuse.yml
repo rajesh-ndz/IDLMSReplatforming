@@ -16,7 +16,7 @@ on:
         default: "main"
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}   # e.g. ap-south-1
+  AWS_REGION: ${{ vars.AWS_REGION }}
 
 permissions:
   id-token: write
@@ -48,18 +48,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Resolve ECR repo URL (SSM first, tfstate fallback)
+      - name: Resolve ECR repo URL (SSM first, platform tfstate fallback)
         id: ecr_repo
         shell: bash
         run: |
           set -euo pipefail
           ENV_IN="${{ github.event.inputs.ENV }}"
           REGION="${{ env.AWS_REGION }}"
-          # 1) Preferred: SSM parameter created by platform-main
           URL="$(aws ssm get-parameter --name "/idlms/ecr/${ENV_IN}/repo_url" --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null || true)"
           if [ -z "$URL" ] || [ "$URL" = "None" ]; then
-            echo "ECR URL not in SSM, trying platform tfstate fallback..."
-            # 2) Fallback: read from platform tfstate bucket (adjust names below if your bucket names differ)
             case "$ENV_IN" in
               dev)   B="dev-btl-idlms-backend-api-tfstate" ;;
               stage) B="stage-btl-idlms-backend-api-tfstate" ;;
@@ -71,7 +68,6 @@ jobs:
             [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
             TMP="/tmp/ecr.tfstate.json"
             aws s3api get-object --bucket "$B" --key "${ENV_IN}/ecr/terraform.tfstate" "$TMP" --region "$LOC" >/dev/null
-            # Try common output names
             URL="$(jq -r '.outputs.repository_urls.value[0] // .outputs.repository_url.value // .outputs.ecr_repository_url.value // empty' "$TMP" || true)"
           fi
           [ -n "$URL" ] && [ "$URL" != "None" ] || { echo "::error::ECR repository URL not found in SSM or tfstate"; exit 1; }
@@ -128,18 +124,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Resolve INSTANCE_ID (SSM, then tfstate, then tags)
+      - name: Resolve INSTANCE_ID (SSM → tfstate → tags)
         id: instance
         shell: bash
         run: |
           set -euo pipefail
           ENV_IN="${{ github.event.inputs.ENV }}"
           REGION="${{ env.AWS_REGION }}"
-
-          # 1) Preferred: SSM set by platform-main
           INSTANCE_ID="$(aws ssm get-parameter --name "/idlms/compute/${ENV_IN}/instance_id" --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null || true)"
-
-          # 2) Fallback: platform tfstate (adjust buckets if different)
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
             case "$ENV_IN" in
               dev)   B="dev-btl-idlms-backend-api-tfstate" ;;
@@ -154,15 +146,12 @@ jobs:
             aws s3api get-object --bucket "$B" --key "${ENV_IN}/compute/terraform.tfstate" "$TMP" --region "$LOC" >/dev/null
             INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty' "$TMP" || true)"
           fi
-
-          # 3) Last resort: look up by tags
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
             INSTANCE_ID="$(aws ec2 describe-instances \
               --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV_IN}" "Name=instance-state-name,Values=running" \
               --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
               --region "$REGION" --output text || true)"
           fi
-
           [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ] || { echo "::error::INSTANCE_ID not found"; exit 1; }
           echo "INSTANCE_ID=$INSTANCE_ID" | tee -a "$GITHUB_ENV" "$GITHUB_OUTPUT"
 
@@ -174,7 +163,6 @@ jobs:
           if [ -n "${{ needs.build_image.outputs.image_uri }}" ]; then
             echo "ECR_REPO_URL=${{ env.ECR_REPO_URL }}" | tee -a "$GITHUB_ENV" "$GITHUB_OUTPUT"
           else
-            # If build was skipped (rollback), ensure ECR_REPO_URL exists as in build step
             ENV_IN="${{ github.event.inputs.ENV }}"
             REGION="${{ env.AWS_REGION }}"
             URL="$(aws ssm get-parameter --name "/idlms/ecr/${ENV_IN}/repo_url" --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null || true)"
@@ -227,7 +215,6 @@ jobs:
           if [ -z "$IMAGE_REPO" ]; then
             echo "::error::ECR_REPO_URL not set"; exit 1
           fi
-
           if [ ! -f docker/docker-compose.yml ]; then
             echo "::error::docker/docker-compose.yml not found in repo"
             exit 1
@@ -303,7 +290,6 @@ jobs:
             --output text \
             --region "${REGION}")"
 
-          # Poll and print logs
           while true; do
             STATUS="$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text --region "$REGION")"
             case "$STATUS" in Pending|InProgress|Delayed) sleep 5 ;; Success|Cancelled|TimedOut|Failed) break ;; *) sleep 5 ;; esac

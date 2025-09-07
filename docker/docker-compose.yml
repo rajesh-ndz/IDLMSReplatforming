@@ -1,38 +1,34 @@
 version: "3.8"
-
 services:
   api1:
     image: ${IMAGE_REPO}:${BUILD_TAG}
-    container_name: api1
-    restart: always
-    env_file:
-      - .env
+    container_name: idlms-api-1
+    restart: unless-stopped
+    env_file: .env
     ports:
-      - "${PORT}:${PORT}"
+      - "${PORT:-4000}:${PORT:-4000}"
     environment:
-      - PORT=${PORT}
-    command: node dist/main.js
+      - PORT=${PORT:-4000}
+    command: ["node","dist/main.js"]
 
   api2:
     image: ${IMAGE_REPO}:${BUILD_TAG}
-    container_name: api2
-    restart: always
-    env_file:
-      - .env
+    container_name: idlms-api-2
+    restart: unless-stopped
+    env_file: .env
     ports:
-      - "${PORT1}:${PORT1}"
+      - "${PORT1:-4001}:${PORT1:-4001}"
     environment:
-      - PORT=${PORT1}
-    command: node dist/main.js
+      - PORT=${PORT1:-4001}
+    command: ["node","dist/main.js"]
 
   api3:
     image: ${IMAGE_REPO}:${BUILD_TAG}
-    container_name: api3
-    restart: always
-    env_file:
-      - .env
+    container_name: idlms-api-3
+    restart: unless-stopped
+    env_file: .env
     ports:
-      - "${PORT2}:${PORT2}"
+      - "${PORT2:-4002}:${PORT2:-4002}"
     environment:
-      - PORT=${PORT2}
-    command: node dist/main.js
+      - PORT=${PORT2:-4002}
+    command: ["node","dist/main.js"]

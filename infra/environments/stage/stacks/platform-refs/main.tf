@@ -24,6 +24,25 @@ data "terraform_remote_state" "rest_api" {
   config  = { bucket = var.tf_state_bucket, key = var.rest_api_state_key, region = var.region }
 }
 
-output "instance_id" { value = try(data.terraform_remote_state.compute.outputs.instance_id, null) }
-output "apigw_invoke_url" { value = try(data.terraform_remote_state.rest_api.outputs.invoke_url, null) }
-output "ecr_repo_url" { value = try(data.terraform_remote_state.ecr.outputs.repository_urls[0], null) }
+locals {
+  instance_id      = try(data.terraform_remote_state.compute.outputs.instance_id, null)
+  ecr_repo_url     = try(
+                      data.terraform_remote_state.ecr.outputs.repository_urls[0],
+                      data.terraform_remote_state.ecr.outputs.repository_url,
+                      data.terraform_remote_state.ecr.outputs.ecr_repository_url,
+                      null)
+  nlb_tg_4000      = try(
+                      data.terraform_remote_state.nlb.outputs.tg_arn_4000,
+                      data.terraform_remote_state.nlb.outputs.target_group_arn_4000,
+                      data.terraform_remote_state.nlb.outputs.tg_4000,
+                      null)
+  apigw_invoke_url = try(
+                      data.terraform_remote_state.rest_api.outputs.invoke_url,
+                      data.terraform_remote_state.rest_api.outputs.apigw_invoke_url,
+                      null)
+}
+
+output "instance_id"      { value = local.instance_id }
+output "ecr_repo_url"     { value = local.ecr_repo_url }
+output "nlb_tg_4000"      { value = local.nlb_tg_4000 }
+output "apigw_invoke_url" { value = local.apigw_invoke_url }
