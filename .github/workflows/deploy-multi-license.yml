@@ -1,9 +1,0 @@
-name: DEPRECATED - Use 'deploy-multi-license-single.yml'
-on: { workflow_dispatch: {} }
-jobs:
-  noop:
-    runs-on: ubuntu-latest
-    steps:
-      - run: |
-          echo "::error::Deprecated. Use '.github/workflows/deploy-multi-license-single.yml'."
-          exit 1

@@ -7,7 +7,7 @@ terraform {
     }
   }
 }
-
+# Provider isn't strictly needed for terraform_remote_state, but harmless.
 provider "aws" {
   region = var.region
 }

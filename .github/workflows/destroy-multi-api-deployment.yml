@@ -1,9 +1,0 @@
-name: DEPRECATED - Do not use directly
-on: { workflow_dispatch: {} }
-jobs:
-  noop:
-    runs-on: ubuntu-latest
-    steps:
-      - run: |
-          echo "::error::This destroy workflow is deprecated/disabled."
-          exit 1
