@@ -1,4 +1,4 @@
-name: Deploy Multi License API with Rollback Options (single)
+name: Deploy Multi License API (reuse platform-main, with rollback)
 
 on:
   workflow_dispatch:
@@ -11,13 +11,12 @@ on:
         description: "If set (latest or 2025.06.30.002), deploy that tag without building"
         required: false
       GIT_REF:
-        description: "Git ref/branch to use for code & TF"
+        description: "Git ref/branch to use for code"
         required: false
         default: "main"
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}   # e.g. ap-south-1
-  TF_BUCKET: test-s3-idlmreplatforming-tfstate
 
 permissions:
   id-token: write
@@ -49,46 +48,34 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Detect TF backend region (for TF_BUCKET)
-        id: detect_tf_backend
+      - name: Resolve ECR repo URL (SSM first, tfstate fallback)
+        id: ecr_repo
         shell: bash
         run: |
           set -euo pipefail
-          LOC="$(aws s3api get-bucket-location --bucket "${TF_BUCKET}" --query 'LocationConstraint' --output text || true)"
-          case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
-          [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::TF bucket region not found"; exit 1; }
-          echo "TF_BACKEND_REGION=$LOC" >> "$GITHUB_ENV"
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: 1.5.0
-          terraform_wrapper: false
-
-      - name: Write ECR tfvars
-        shell: bash
-        run: |
-          mkdir -p infra/ecr
-          cat > "infra/ecr/${{ github.event.inputs.ENV }}.tfvars" <<EOF
-          environment          = "${{ github.event.inputs.ENV }}"
-          region               = "${{ env.AWS_REGION }}"
-          image_tag_mutability = "MUTABLE"
-          scan_on_push         = true
-          encryption_type      = "AES256"
-          EOF
-
-      - name: Ensure/Output ECR repo
-        id: ecr
-        shell: bash
-        run: |
-          set -euo pipefail
-          terraform -chdir=infra/ecr init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ecr/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform -chdir=infra/ecr apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-          ECR_REPO_URL="$(terraform -chdir=infra/ecr output -raw ecr_repository_url | tr -d '\r')"
-          echo "ECR_REPO_URL=$ECR_REPO_URL" >> "$GITHUB_ENV"
+          ENV_IN="${{ github.event.inputs.ENV }}"
+          REGION="${{ env.AWS_REGION }}"
+          # 1) Preferred: SSM parameter created by platform-main
+          URL="$(aws ssm get-parameter --name "/idlms/ecr/${ENV_IN}/repo_url" --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null || true)"
+          if [ -z "$URL" ] || [ "$URL" = "None" ]; then
+            echo "ECR URL not in SSM, trying platform tfstate fallback..."
+            # 2) Fallback: read from platform tfstate bucket (adjust names below if your bucket names differ)
+            case "$ENV_IN" in
+              dev)   B="dev-btl-idlms-backend-api-tfstate" ;;
+              stage) B="stage-btl-idlms-backend-api-tfstate" ;;
+              prod)  B="prod-btl-idlms-backend-api-tfstate" ;;
+              *)     echo "::error::Unknown ENV"; exit 1 ;;
+            esac
+            LOC="$(aws s3api get-bucket-location --bucket "$B" --query 'LocationConstraint' --output text || true)"
+            case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
+            [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
+            TMP="/tmp/ecr.tfstate.json"
+            aws s3api get-object --bucket "$B" --key "${ENV_IN}/ecr/terraform.tfstate" "$TMP" --region "$LOC" >/dev/null
+            # Try common output names
+            URL="$(jq -r '.outputs.repository_urls.value[0] // .outputs.repository_url.value // .outputs.ecr_repository_url.value // empty' "$TMP" || true)"
+          fi
+          [ -n "$URL" ] && [ "$URL" != "None" ] || { echo "::error::ECR repository URL not found in SSM or tfstate"; exit 1; }
+          echo "ECR_REPO_URL=$URL" | tee -a "$GITHUB_ENV" "$GITHUB_OUTPUT"
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -112,13 +99,13 @@ jobs:
 
       - name: Build and tag Docker image
         shell: bash
-        run: docker build -t "$IMAGE_URI" -t "$LATEST_URI" -f docker/Dockerfile src
+        run: docker build -t "${{ env.IMAGE_URI }}" -t "${{ env.LATEST_URI }}" -f docker/Dockerfile src
 
       - name: Push Docker images to ECR
         shell: bash
         run: |
-          docker push "$IMAGE_URI"
-          docker push "$LATEST_URI"
+          docker push "${{ env.IMAGE_URI }}"
+          docker push "${{ env.LATEST_URI }}"
 
   deploy:
     runs-on: ubuntu-latest
@@ -141,71 +128,73 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Map platform-main state bucket per ENV
-        id: map_platform_bucket
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${{ github.event.inputs.ENV }}" in
-            dev)   B="dev-btl-idlms-repo-backend-api-tfstate-592776312448" ;;
-            stage) B="stage-btl-idlms-repo-backend-api-tfstate-592776312448" ;;
-            prod)  B="prod-btl-idlms-repo-backend-api-tfstate-592776312448" ;;
-            *)     echo "::error::Unknown ENV"; exit 1 ;;
-          esac
-          echo "PLATFORM_STATE_BUCKET=$B" >> "$GITHUB_ENV"
-
-      - name: Detect platform-main state region
-        id: detect_platform_region
-        shell: bash
-        run: |
-          set -euo pipefail
-          B="$PLATFORM_STATE_BUCKET"
-          LOC="$(aws s3api get-bucket-location --bucket "$B" --query 'LocationConstraint' --output text || true)"
-          case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
-          [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
-          echo "PLATFORM_STATE_REGION=$LOC" >> "$GITHUB_ENV"
-
-      - name: Read INSTANCE_ID from platform tfstate
+      - name: Resolve INSTANCE_ID (SSM, then tfstate, then tags)
+        id: instance
         shell: bash
         run: |
           set -euo pipefail
           ENV_IN="${{ github.event.inputs.ENV }}"
-          B="$PLATFORM_STATE_BUCKET"
-          R="$PLATFORM_STATE_REGION"
-          mkdir -p /tmp/idlms_state
-          aws s3api get-object --bucket "$B" --key "${ENV_IN}/compute/terraform.tfstate" /tmp/idlms_state/compute.json --region "$R" >/dev/null
-          INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty' /tmp/idlms_state/compute.json)"
-          [ -z "$INSTANCE_ID" ] && { echo "::error::INSTANCE_ID not found in platform state"; exit 1; }
-          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          REGION="${{ env.AWS_REGION }}"
 
-      - name: Detect TF backend region (for TF_BUCKET)
-        id: detect_tf_backend_deploy
-        shell: bash
-        run: |
-          set -euo pipefail
-          LOC="$(aws s3api get-bucket-location --bucket "${TF_BUCKET}" --query 'LocationConstraint' --output text || true)"
-          case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
-          [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::TF bucket region not found"; exit 1; }
-          echo "TF_BACKEND_REGION=$LOC" >> "$GITHUB_ENV"
+          # 1) Preferred: SSM set by platform-main
+          INSTANCE_ID="$(aws ssm get-parameter --name "/idlms/compute/${ENV_IN}/instance_id" --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null || true)"
 
-      - name: Resolve ECR repository URL (from this repo's ecr tfstate)
+          # 2) Fallback: platform tfstate (adjust buckets if different)
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            case "$ENV_IN" in
+              dev)   B="dev-btl-idlms-backend-api-tfstate" ;;
+              stage) B="stage-btl-idlms-backend-api-tfstate" ;;
+              prod)  B="prod-btl-idlms-backend-api-tfstate" ;;
+              *)     echo "::error::Unknown ENV"; exit 1 ;;
+            esac
+            LOC="$(aws s3api get-bucket-location --bucket "$B" --query 'LocationConstraint' --output text || true)"
+            case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
+            [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
+            TMP="/tmp/compute.tfstate.json"
+            aws s3api get-object --bucket "$B" --key "${ENV_IN}/compute/terraform.tfstate" "$TMP" --region "$LOC" >/dev/null
+            INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty' "$TMP" || true)"
+          fi
+
+          # 3) Last resort: look up by tags
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            INSTANCE_ID="$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV_IN}" "Name=instance-state-name,Values=running" \
+              --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
+              --region "$REGION" --output text || true)"
+          fi
+
+          [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ] || { echo "::error::INSTANCE_ID not found"; exit 1; }
+          echo "INSTANCE_ID=$INSTANCE_ID" | tee -a "$GITHUB_ENV" "$GITHUB_OUTPUT"
+
+      - name: Resolve ECR repository URL (reuse build output or re-fetch)
         id: ecr_url
         shell: bash
         run: |
           set -euo pipefail
-          ENV_IN="${{ github.event.inputs.ENV }}"
-          KEY="${ENV_IN}/ecr/terraform.tfstate"
-          TMP="/tmp/ecr.tfstate.json"
-          if aws s3api head-object --bucket "${TF_BUCKET}" --key "$KEY" --region "${TF_BACKEND_REGION}" >/dev/null 2>&1; then
-            aws s3api get-object --bucket "${TF_BUCKET}" --key "$KEY" "$TMP" --region "${TF_BACKEND_REGION}" >/dev/null
-            URL="$(jq -r '.outputs.ecr_repository_url.value // empty' "$TMP" || true)"
+          if [ -n "${{ needs.build_image.outputs.image_uri }}" ]; then
+            echo "ECR_REPO_URL=${{ env.ECR_REPO_URL }}" | tee -a "$GITHUB_ENV" "$GITHUB_OUTPUT"
           else
-            URL=""
+            # If build was skipped (rollback), ensure ECR_REPO_URL exists as in build step
+            ENV_IN="${{ github.event.inputs.ENV }}"
+            REGION="${{ env.AWS_REGION }}"
+            URL="$(aws ssm get-parameter --name "/idlms/ecr/${ENV_IN}/repo_url" --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null || true)"
+            if [ -z "$URL" ] || [ "$URL" = "None" ]; then
+              case "$ENV_IN" in
+                dev)   B="dev-btl-idlms-backend-api-tfstate" ;;
+                stage) B="stage-btl-idlms-backend-api-tfstate" ;;
+                prod)  B="prod-btl-idlms-backend-api-tfstate" ;;
+                *)     echo "::error::Unknown ENV"; exit 1 ;;
+              esac
+              LOC="$(aws s3api get-bucket-location --bucket "$B" --query 'LocationConstraint' --output text || true)"
+              case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
+              [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
+              TMP="/tmp/ecr.tfstate.json"
+              aws s3api get-object --bucket "$B" --key "${ENV_IN}/ecr/terraform.tfstate" "$TMP" --region "$LOC" >/dev/null
+              URL="$(jq -r '.outputs.repository_urls.value[0] // .outputs.repository_url.value // .outputs.ecr_repository_url.value // empty' "$TMP" || true)"
+            fi
+            [ -n "$URL" ] && [ "$URL" != "None" ] || { echo "::error::ECR repository URL not found for rollback flow"; exit 1; }
+            echo "ECR_REPO_URL=$URL" | tee -a "$GITHUB_ENV" "$GITHUB_OUTPUT"
           fi
-          [ -z "$URL" ] && { echo "::error::ECR repository URL not found. Ensure build_image ran successfully at least once."; exit 1; }
-          echo "ECR_REPO_URL=$URL" >> "$GITHUB_ENV"
-          echo "ECR_REPO_URL=$URL" >> "$GITHUB_OUTPUT"
-          echo "Using ECR: $URL"
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -239,14 +228,12 @@ jobs:
             echo "::error::ECR_REPO_URL not set"; exit 1
           fi
 
-          # Ensure compose file exists in repo; embed it for the instance
           if [ ! -f docker/docker-compose.yml ]; then
             echo "::error::docker/docker-compose.yml not found in repo"
             exit 1
           fi
           COMPOSE_B64="$(base64 -w 0 docker/docker-compose.yml)"
 
-          # No local expansion; placeholders replaced below
           cat > ssm-deploy.json <<'JSON'
           {
             "commands": [
@@ -262,7 +249,7 @@ jobs:
               "REGION=__REGION__",
 
               "PARAM=\"/idlms/shared/${ENV_NAME}/.env\"",
-              "ENV_CONTENT=$(aws ssm get-parameter --name \"$PARAM\" --with-decryption --query \"Parameter.Value\" --output text || echo '')",
+              "ENV_CONTENT=$(aws ssm get-parameter --name \"$PARAM\" --with-decryption --query \"Parameter.Value\" --output text --region ${REGION} 2>/dev/null || echo '')",
               "printf \"%s\" \"$ENV_CONTENT\" > .env",
               "grep -q '^IMAGE_REPO=' .env && sed -i 's|^IMAGE_REPO=.*|IMAGE_REPO='\"${IMAGE_REPO}\"'|' .env || echo \"IMAGE_REPO=${IMAGE_REPO}\" >> .env",
               "grep -q '^BUILD_TAG=' .env && sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${TAG}\"'|' .env || echo \"BUILD_TAG=${TAG}\" >> .env",
@@ -275,11 +262,7 @@ jobs:
               "deploy_tag() {",
               "  local tag=\"$1\"",
               "  sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${tag}\"'|' .env || true",
-              "  echo '--- docker compose config ---'",
-              "  ${DC} --env-file .env config || true",
-              "  echo '--- docker compose pull ---'",
               "  ${DC} --env-file .env pull --ignore-pull-failures || true",
-              "  echo '--- docker compose up -d ---'",
               "  ${DC} --env-file .env up -d --force-recreate || true",
               "  sleep 25",
               "  CNT=$(docker ps --format '{{.Image}} {{.Status}}' | awk -v img=\"${IMAGE_REPO}:${tag}\" '$1==img && $2 ~ /^Up/ {c++} END{print c+0}')",
@@ -287,12 +270,11 @@ jobs:
               "}",
 
               "if deploy_tag \"${TAG}\"; then",
-              "  echo \"Deployment OK for ${TAG}. Recording last-successful-build...\"",
-              "  aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \"${TAG}\" --type String --overwrite --region ${REGION}",
+              "  aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \"${TAG}\" --type String --overwrite --region ${REGION} || true",
               "  exit 0",
               "fi",
 
-              "echo 'Deployment failed. Attempting rollback to previous successful tag...' >&2",
+              "echo 'Deployment failed. Attempting rollback...' >&2",
               "PREV=$(aws ssm get-parameter --name \"/idlms/license-api/last-successful-build\" --query \"Parameter.Value\" --output text --region ${REGION} 2>/dev/null || echo '')",
               "if [ -n \"$PREV\" ] && [ \"$PREV\" != \"None\" ]; then",
               "  if deploy_tag \"$PREV\"; then echo \"Rollback succeeded to ${PREV}\"; exit 0; fi",
@@ -321,7 +303,7 @@ jobs:
             --output text \
             --region "${REGION}")"
 
-          # Poll and print logs so failures are obvious
+          # Poll and print logs
           while true; do
             STATUS="$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text --region "$REGION")"
             case "$STATUS" in Pending|InProgress|Delayed) sleep 5 ;; Success|Cancelled|TimedOut|Failed) break ;; *) sleep 5 ;; esac

@@ -1,52 +1,14 @@
-locals {
-  network_key  = "${var.env_name}/network/terraform.tfstate"
-  compute_key  = "${var.env_name}/compute/terraform.tfstate"
-  nlb_key      = "${var.env_name}/nlb/terraform.tfstate"
-  ecr_key      = "${var.env_name}/ecr/terraform.tfstate"
-  rest_api_key = "${var.env_name}/rest-api/terraform.tfstate"
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers { aws = { source = "hashicorp/aws", version = ">= 5.0" } }
 }
 
-data "terraform_remote_state" "network" {
-  backend = "s3"
-  config = {
-    bucket = var.platform_state_bucket
-    key    = local.network_key
-    region = var.platform_state_region
-  }
-}
+data "terraform_remote_state" "compute" { backend = "s3" config = { bucket = var.tf_state_bucket key = var.compute_state_key region = var.region } }
+data "terraform_remote_state" "ecr"     { backend = "s3" config = { bucket = var.tf_state_bucket key = var.ecr_state_key     region = var.region } }
+data "terraform_remote_state" "nlb"     { backend = "s3" config = { bucket = var.tf_state_bucket key = var.nlb_state_key     region = var.region } }
+data "terraform_remote_state" "rest_api"{ backend = "s3" config = { bucket = var.tf_state_bucket key = var.rest_api_state_key region = var.region } }
 
-data "terraform_remote_state" "compute" {
-  backend = "s3"
-  config = {
-    bucket = var.platform_state_bucket
-    key    = local.compute_key
-    region = var.platform_state_region
-  }
-}
-
-data "terraform_remote_state" "nlb" {
-  backend = "s3"
-  config = {
-    bucket = var.platform_state_bucket
-    key    = local.nlb_key
-    region = var.platform_state_region
-  }
-}
-
-data "terraform_remote_state" "ecr" {
-  backend = "s3"
-  config = {
-    bucket = var.platform_state_bucket
-    key    = local.ecr_key
-    region = var.platform_state_region
-  }
-}
-
-data "terraform_remote_state" "rest_api" {
-  backend = "s3"
-  config = {
-    bucket = var.platform_state_bucket
-    key    = local.rest_api_key
-    region = var.platform_state_region
-  }
-}
+output "instance_id"       { value = try(data.terraform_remote_state.compute.outputs.instance_id, null) }
+output "ecr_repo_url"      { value = try(data.terraform_remote_state.ecr.outputs.repository_urls[0], null) }
+output "nlb_tg_4000"       { value = try(data.terraform_remote_state.nlb.outputs.tg_arn_4000, null) }
+output "apigw_invoke_url"  { value = try(data.terraform_remote_state.rest_api.outputs.invoke_url, null) }

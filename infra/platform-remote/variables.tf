@@ -1,16 +1,27 @@
-variable "env_name" {
-  description = "Environment name (dev|stage|prod)"
-  type        = string
-}
 variable "region" {
-  description = "AWS region for provider operations"
-  type        = string
+  type    = string
+  default = "ap-south-1"
 }
-variable "platform_state_bucket" {
-  description = "S3 bucket that stores platform-main states"
-  type        = string
+variable "tf_state_bucket" {
+  type = string
 }
-variable "platform_state_region" {
-  description = "Region of the platform-main state bucket"
-  type        = string
+variable "network_state_key" {
+  type    = string
+  default = "stage/network/terraform.tfstate"
+}
+variable "compute_state_key" {
+  type    = string
+  default = "stage/compute/terraform.tfstate"
+}
+variable "ecr_state_key" {
+  type    = string
+  default = "stage/ecr/terraform.tfstate"
+}
+variable "nlb_state_key" {
+  type    = string
+  default = "stage/nlb/terraform.tfstate"
+}
+variable "rest_api_state_key" {
+  type    = string
+  default = "stage/rest-api/terraform.tfstate"
 }
