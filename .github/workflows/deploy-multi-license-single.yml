@@ -16,7 +16,7 @@ on:
         default: "main"
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REGION: ${{ vars.AWS_REGION }}   # app region (e.g., ap-south-1)
   TF_BUCKET: test-s3-idlmreplatforming-tfstate
 
 permissions:
@@ -28,6 +28,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ───────────────── Build Image (when not rolling back) ─────────────────
   build_image:
     if: ${{ !github.event.inputs.ROLLBACK_TAG }}
     runs-on: ubuntu-latest
@@ -55,14 +56,8 @@ jobs:
         run: |
           set -euo pipefail
           LOC="$(aws s3api get-bucket-location --bucket "${TF_BUCKET}" --query 'LocationConstraint' --output text || true)"
-          case "$LOC" in
-            None) LOC="us-east-1" ;;
-            EU)   LOC="eu-west-1" ;;
-          esac
-          if [ -z "$LOC" ] || [ "$LOC" = "null" ]; then
-            echo "::error::Could not detect region for bucket ${TF_BUCKET}"
-            exit 1
-          fi
+          case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
+          [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::TF bucket region not found"; exit 1; }
           echo "TF_BACKEND_REGION=$LOC" >> "$GITHUB_ENV"
 
       - name: Set up Terraform
@@ -126,6 +121,7 @@ jobs:
           docker push "$IMAGE_URI"
           docker push "$LATEST_URI"
 
+  # ───────────────── Deploy (reads platform-main tfstate via S3) ─────────────────
   deploy:
     runs-on: ubuntu-latest
     needs: [build_image]
@@ -150,18 +146,12 @@ jobs:
         run: |
           set -euo pipefail
           case "${{ github.event.inputs.ENV }}" in
-            dev)
-              echo "PLATFORM_STATE_BUCKET=dev-btl-idlms-repo-backend-api-tfstate-592776312448" >> "$GITHUB_ENV"
-              ;;
-            stage)
-              echo "PLATFORM_STATE_BUCKET=stage-btl-idlms-repo-backend-api-tfstate-592776312448" >> "$GITHUB_ENV"
-              ;;
-            prod)
-              echo "PLATFORM_STATE_BUCKET=prod-btl-idlms-repo-backend-api-tfstate-592776312448" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "::error::Unknown ENV"; exit 1 ;;
+            dev)   B="dev-btl-idlms-repo-backend-api-tfstate-592776312448" ;;
+            stage) B="stage-btl-idlms-repo-backend-api-tfstate-592776312448" ;;
+            prod)  B="prod-btl-idlms-repo-backend-api-tfstate-592776312448" ;;
+            *)     echo "::error::Unknown ENV"; exit 1 ;;
           esac
+          echo "PLATFORM_STATE_BUCKET=$B" >> "$GITHUB_ENV"
 
       - name: Detect platform-main state region
         id: detect_platform_region
@@ -170,35 +160,41 @@ jobs:
           set -euo pipefail
           B="$PLATFORM_STATE_BUCKET"
           LOC="$(aws s3api get-bucket-location --bucket "$B" --query 'LocationConstraint' --output text || true)"
-          case "$LOC" in
-            None) LOC="us-east-1" ;;
-            EU)   LOC="eu-west-1" ;;
-          esac
-          if [ -z "$LOC" ] || [ "$LOC" = "null" ]; then
-            echo "::error::Could not detect region for bucket $B"
-            exit 1
-          fi
+          case "$LOC" in None) LOC="us-east-1" ;; EU) LOC="eu-west-1" ;; esac
+          [ -z "$LOC" ] || [ "$LOC" = "null" ] && { echo "::error::Platform bucket region not found"; exit 1; }
           echo "PLATFORM_STATE_REGION=$LOC" >> "$GITHUB_ENV"
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: 1.5.0
-        # terraform_wrapper default is true here; okay for read-only apply
-
-      - name: Read platform-main outputs
-        working-directory: infra/platform-remote
+      # ⬇⬇⬇ REPLACEMENT STEP: read tfstate JSONs directly from S3 (no terraform apply) ⬇⬇⬇
+      - name: Read platform-main outputs (direct from S3 tfstate)
         shell: bash
         run: |
           set -euo pipefail
-          terraform init -input=false -upgrade
-          terraform apply -input=false -auto-approve \
-            -var="env_name=${{ github.event.inputs.ENV }}" \
-            -var="region=${AWS_REGION}" \
-            -var="platform_state_bucket=${PLATFORM_STATE_BUCKET}" \
-            -var="platform_state_region=${PLATFORM_STATE_REGION}"
-          terraform output -json > /tmp/platform_outputs.json
-          echo "INSTANCE_ID=$(jq -r '.instance_id.value // empty' /tmp/platform_outputs.json)" >> "$GITHUB_ENV"
+          ENV_IN="${{ github.event.inputs.ENV }}"
+          B="$PLATFORM_STATE_BUCKET"
+          R="$PLATFORM_STATE_REGION"
+
+          fetch() { local key="$1"; local out="$2";
+            aws s3api get-object --bucket "$B" --key "$key" "$out" --region "$R" >/dev/null 2>&1 || true; }
+
+          mkdir -p /tmp/idlms_state
+          fetch "${ENV_IN}/compute/terraform.tfstate" /tmp/idlms_state/compute.json
+          fetch "${ENV_IN}/nlb/terraform.tfstate"     /tmp/idlms_state/nlb.json
+          fetch "${ENV_IN}/rest-api/terraform.tfstate" /tmp/idlms_state/rest.json
+          fetch "${ENV_IN}/network/terraform.tfstate"  /tmp/idlms_state/network.json
+
+          INSTANCE_ID="$(jq -r '.outputs.instance_id.value // empty'         /tmp/idlms_state/compute.json 2>/dev/null || true)"
+          LB_DNS="$(jq -r '.outputs.lb_dns_name.value // empty'              /tmp/idlms_state/nlb.json     2>/dev/null || true)"
+          APIGW_URL="$(jq -r '.outputs.invoke_url.value // empty'            /tmp/idlms_state/rest.json    2>/dev/null || true)"
+          VPC_ID="$(jq -r '.outputs.vpc_id.value // empty'                   /tmp/idlms_state/network.json 2>/dev/null || true)"
+
+          [ -z "$INSTANCE_ID" ] && { echo "::error::INSTANCE_ID not found in platform state"; exit 1; }
+
+          {
+            echo "INSTANCE_ID=$INSTANCE_ID"
+            echo "NLB_DNS=$LB_DNS"
+            echo "APIGW_INVOKE_URL=$APIGW_URL"
+            echo "VPC_ID=$VPC_ID"
+          } >> "$GITHUB_ENV"
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -216,31 +212,6 @@ jobs:
             TAG="latest"
           fi
           echo "TAG_TO_DEPLOY=$TAG" | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
-
-      - name: Resolve EC2 instance (fallback)
-        id: resolve_ec2
-        shell: bash
-        run: |
-          set -euo pipefail
-          ENV_INPUT="${{ github.event.inputs.ENV }}"
-          REGION="${{ env.AWS_REGION }}"
-          if [ -z "${INSTANCE_ID:-}" ] || [ "${INSTANCE_ID}" = "null" ]; then
-            INSTANCE_ID="$(aws ec2 describe-instances \
-              --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV_INPUT}" "Name=instance-state-name,Values=running" \
-              --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
-              --region "$REGION" --output text || true)"
-          fi
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            INSTANCE_ID="$(aws ec2 describe-instances \
-              --filters "Name=tag:Name,Values=${ENV_INPUT}-idlms-app" "Name=instance-state-name,Values=running" \
-              --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
-              --region "$REGION" --output text || true)"
-          fi
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "::error::No running EC2 instance found for environment $ENV_INPUT"
-            exit 1
-          fi
-          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
 
       - name: Deploy containers via SSM
         shell: bash
@@ -282,6 +253,7 @@ jobs:
             --region "$AWS_REGION")"
           echo "SSM Command: $CMD_ID"
 
+  # ───────────────── Verify ─────────────────
   verify:
     name: Post-deploy health check
     runs-on: ubuntu-latest
@@ -325,7 +297,7 @@ jobs:
           {
             "commands": [
               "set -e",
-              "if ! command -v docker >/dev/null 2>&1; then echo 'pods not up'; exit 1; fi",
+              "if ! command -v docker >/dev/null 2.>/dev/null; then echo 'pods not up'; exit 1; fi",
               "CNT=$(docker ps --format '{{.Names}} {{.Status}}' | awk '$2 ~ /^Up/ {c++} END{print c+0}')",
               "if [ \"$CNT\" -ge 1 ]; then echo 'pods up'; else echo 'pods not up'; exit 1; fi"
             ]
@@ -351,7 +323,4 @@ jobs:
           done
           echo "SSM status: $STATUS"
           aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text || true
-          if [ "$STATUS" != "Success" ]; then
-            echo "::error::pods not up"
-            exit 1
-          fi
+          if [ "$STATUS" != "Success" ]; then echo "::error::pods not up"; exit 1; fi
