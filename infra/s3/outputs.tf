@@ -1,3 +1,6 @@
-output "s3_bucket_name" {
-  value = aws_s3_bucket.artifact.bucket
+output "artifact_bucket_name" {
+  value = nonsensitive(data.aws_ssm_parameter.bucket_name.value)
+}
+output "artifact_default_key" {
+  value = nonsensitive(data.aws_ssm_parameter.default_key.value)
 }

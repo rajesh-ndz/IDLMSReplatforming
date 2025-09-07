@@ -1,9 +1,16 @@
 variable "environment" {
-  description = "Deployment environment"
+  description = "Deployment environment (e.g., dev, stage, prod)"
   type        = string
 }
 
-variable "enable_versioning" {
-  description = "Enable versioning on the S3 bucket"
-  type        = bool
+variable "region" {
+  description = "AWS region"
+  type        = string
+  default     = "ap-south-1"
+}
+
+variable "ssm_prefix" {
+  description = "SSM path prefix where platform-main publishes the artifact bucket"
+  type        = string
+  default     = "/idlms/artifacts"
 }

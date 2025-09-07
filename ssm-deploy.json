@@ -1,0 +1,56 @@
+{
+  "commands": [
+    "set -eu; [ -n \"$BASH_VERSION\" ] && set -o pipefail",
+    "cd /home/ubuntu",
+
+    "echo \"dmVyc2lvbjogIjMuOCIKCnNlcnZpY2VzOgogIGFwaTE6CiAgICBpbWFnZTogJHtJTUFHRV9SRVBPfToke0JVSUxEX1RBR30KICAgIGNvbnRhaW5lcl9uYW1lOiBhcGkxCiAgICByZXN0YXJ0OiBhbHdheXMKICAgIGVudl9maWxlOgogICAgICAtIC5lbnYKICAgIHBvcnRzOgogICAgICAtICIke1BPUlR9OiR7UE9SVH0iCiAgICBlbnZpcm9ubWVudDoKICAgICAgLSBQT1JUPSR7UE9SVH0KICAgIGNvbW1hbmQ6IG5vZGUgZGlzdC9tYWluLmpzCgogIGFwaTI6CiAgICBpbWFnZTogJHtJTUFHRV9SRVBPfToke0JVSUxEX1RBR30KICAgIGNvbnRhaW5lcl9uYW1lOiBhcGkyCiAgICByZXN0YXJ0OiBhbHdheXMKICAgIGVudl9maWxlOgogICAgICAtIC5lbnYKICAgIHBvcnRzOgogICAgICAtICIke1BPUlQxfToke1BPUlQxfSIKICAgIGVudmlyb25tZW50OgogICAgICAtIFBPUlQ9JHtQT1JUMX0KICAgIGNvbW1hbmQ6IG5vZGUgZGlzdC9tYWluLmpzCgogIGFwaTM6CiAgICBpbWFnZTogJHtJTUFHRV9SRVBPfToke0JVSUxEX1RBR30KICAgIGNvbnRhaW5lcl9uYW1lOiBhcGkzCiAgICByZXN0YXJ0OiBhbHdheXMKICAgIGVudl9maWxlOgogICAgICAtIC5lbnYKICAgIHBvcnRzOgogICAgICAtICIke1BPUlQyfToke1BPUlQyfSIKICAgIGVudmlyb25tZW50OgogICAgICAtIFBPUlQ9JHtQT1JUMn0KICAgIGNvbW1hbmQ6IG5vZGUgZGlzdC9tYWluLmpzCg==\" | base64 -d > docker-compose.yml",
+    "chown ubuntu:ubuntu docker-compose.yml || true",
+
+    "ENV_NAME=stage",
+    "TAG=2025.09.07.022",
+    "IMAGE_REPO=592776312448.dkr.ecr.ap-south-1.amazonaws.com/license-api-stage",
+    "REGION=ap-south-1",
+
+    "PARAM=\"/idlms/shared/${ENV_NAME}/.env\"",
+    "ENV_CONTENT=$(aws ssm get-parameter --name \"$PARAM\" --with-decryption --query \"Parameter.Value\" --output text || echo '')",
+    "printf \"%s\" \"$ENV_CONTENT\" > .env",
+    "grep -q '^IMAGE_REPO=' .env && sed -i 's|^IMAGE_REPO=.*|IMAGE_REPO='\"${IMAGE_REPO}\"'|' .env || echo \"IMAGE_REPO=${IMAGE_REPO}\" >> .env",
+    "grep -q '^BUILD_TAG=' .env && sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${TAG}\"'|' .env || echo \"BUILD_TAG=${TAG}\" >> .env",
+
+    "if docker compose version >/dev/null 2>&1; then DC='docker compose'; elif command -v docker-compose >/dev/null 2>&1; then DC='docker-compose'; else curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; DC='docker-compose'; fi",
+
+    "ECR_HOST=${IMAGE_REPO%%/*}",
+    "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_HOST}",
+
+    "deploy_tag() {",
+    "  local tag=\"$1\"",
+    "  sed -i 's|^BUILD_TAG=.*|BUILD_TAG='\"${tag}\"'|' .env || true",
+    "  echo '--- docker compose config ---'",
+    "  ${DC} --env-file .env config || true",
+    "  echo '--- docker compose pull ---'",
+    "  ${DC} --env-file .env pull --ignore-pull-failures || true",
+    "  echo '--- docker compose up -d ---'",
+    "  ${DC} --env-file .env up -d --force-recreate || true",
+    "  sleep 25",
+    "  CNT=$(docker ps --format '{{.Image}} {{.Status}}' | awk -v img=\"${IMAGE_REPO}:${tag}\" '$1==img && $2 ~ /^Up/ {c++} END{print c+0}')",
+    "  if [ \"$CNT\" -ge 1 ]; then return 0; else return 1; fi",
+    "}",
+
+    "if deploy_tag \"${TAG}\"; then",
+    "  echo \"Deployment OK for ${TAG}. Recording last-successful-build...\"",
+    "  aws ssm put-parameter --name \"/idlms/license-api/last-successful-build\" --value \"${TAG}\" --type String --overwrite --region ${REGION}",
+    "  exit 0",
+    "fi",
+
+    "echo 'Deployment failed. Attempting rollback to previous successful tag...' >&2",
+    "PREV=$(aws ssm get-parameter --name \"/idlms/license-api/last-successful-build\" --query \"Parameter.Value\" --output text --region ${REGION} 2>/dev/null || echo '')",
+    "if [ -n \"$PREV\" ] && [ \"$PREV\" != \"None\" ]; then",
+    "  if deploy_tag \"$PREV\"; then echo \"Rollback succeeded to ${PREV}\"; exit 0; fi",
+    "fi",
+
+    "echo '------ diagnostics: docker ps -a ------'",
+    "docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}'",
+    "for c in $(docker ps -a --format '{{.Names}}'); do echo \"========== logs: $c ==========\"; docker logs --tail 200 \"$c\" || true; done",
+    "exit 1"
+  ]
+}
