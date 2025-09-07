@@ -16,9 +16,8 @@ on:
         default: "main"
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}               # Region for resources/ECR (e.g., ap-south-1)
-  TF_BUCKET: test-s3-idlmreplatforming-tfstate     # <-- your TF state bucket (lives in ap-southeast-1)
-  BACKUP_BUCKET: test-s3-idlmreplatforming-artifact
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_BUCKET: test-s3-idlmreplatforming-tfstate
 
 permissions:
   id-token: write
@@ -28,11 +27,7 @@ concurrency:
   group: deploy-single-${{ github.event.inputs.ENV }}
   cancel-in-progress: false
 
-# Small reusable script to detect an S3 bucket's region
-# Returns us-east-1 for "None", eu-west-1 for legacy "EU", otherwise the value.
-# We call this once at the start of each job that touches Terraform.
 jobs:
-  # ───────────────────────────── Build Image (only when no rollback tag) ─────────────────────────────
   build_image:
     if: ${{ !github.event.inputs.ROLLBACK_TAG }}
     runs-on: ubuntu-latest
@@ -54,89 +49,8 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Detect TF backend region (for ${TF_BUCKET})
-        id: detect_tf_region
-        shell: bash
-        run: |
-          set -euo pipefail
-          LOC="$(aws s3api get-bucket-location --bucket "${TF_BUCKET}" --query 'LocationConstraint' --output text || true)"
-          case "$LOC" in
-            None) LOC="us-east-1" ;;   # AWS returns 'None' for us-east-1
-            EU)   LOC="eu-west-1" ;;   # very old buckets can return 'EU'
-          esac
-          if [ -z "$LOC" ] || [ "$LOC" = "null" ]; then
-            echo "::error::Could not detect region for bucket ${TF_BUCKET}"
-            exit 1
-          fi
-          echo "TF_BACKEND_REGION=$LOC" | tee -a "$GITHUB_ENV"
-          echo "Detected TF_BACKEND_REGION=$LOC for bucket ${TF_BUCKET}"
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: 1.5.0
-          terraform_wrapper: false
-
-      - name: Ensure/Output ECR repo (build path)
-        id: ecr
-        shell: bash
-        run: |
-          set -euo pipefail
-          terraform -chdir=infra/ecr init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ecr/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform -chdir=infra/ecr apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-          ECR_REPO_URL=$(terraform -chdir=infra/ecr output -raw ecr_repository_url | tr -d '\r')
-          echo "ECR_REPO_URL=$ECR_REPO_URL" >> "$GITHUB_ENV"
-          echo "Using ECR: $ECR_REPO_URL"
-
-      - name: Log in to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Generate build tags
-        id: tags
-        shell: bash
-        run: |
-          ECR_REPO_URL="${{ env.ECR_REPO_URL }}"
-          DATE_TAG=$(date -u +'%Y.%m.%d')
-          BUILD_NUM=$(printf "%03d" $GITHUB_RUN_NUMBER)
-          BUILD_TAG="${DATE_TAG}.${BUILD_NUM}"
-          IMAGE_URI="${ECR_REPO_URL}:${BUILD_TAG}"
-          LATEST_URI="${ECR_REPO_URL}:latest"
-          echo "BUILD_TAG=$BUILD_TAG"    | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_URI=$IMAGE_URI"   | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
-          echo "LATEST_URI=$LATEST_URI" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
-
-      - name: Build and tag Docker image
-        run: docker build -t "$IMAGE_URI" -t "$LATEST_URI" -f docker/Dockerfile src
-
-      - name: Push Docker images to ECR
-        run: |
-          docker push "$IMAGE_URI"
-          docker push "$LATEST_URI"
-
-  # ─────────────────────────────── Provision Infra (always) ───────────────────────────────
-  provision_infra:
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.ENV }}
-    outputs:
-      ecr_repo_url: ${{ steps.ecr.outputs.ECR_REPO_URL }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.GIT_REF }}
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Detect TF backend region (for ${TF_BUCKET})
-        id: detect_tf_region
+      - name: Detect TF backend region (for TF_BUCKET)
+        id: detect_tf_backend
         shell: bash
         run: |
           set -euo pipefail
@@ -149,8 +63,7 @@ jobs:
             echo "::error::Could not detect region for bucket ${TF_BUCKET}"
             exit 1
           fi
-          echo "TF_BACKEND_REGION=$LOC" | tee -a "$GITHUB_ENV"
-          echo "Detected TF_BACKEND_REGION=$LOC for bucket ${TF_BUCKET}"
+          echo "TF_BACKEND_REGION=$LOC" >> "$GITHUB_ENV"
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v2
@@ -158,47 +71,19 @@ jobs:
           terraform_version: 1.5.0
           terraform_wrapper: false
 
-      - name: Terraform Apply VPC
+      - name: Write ECR tfvars
         shell: bash
         run: |
-          cd infra/vpc
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/vpc/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
+          mkdir -p infra/ecr
+          cat > "infra/ecr/${{ github.event.inputs.ENV }}.tfvars" <<EOF
+          environment          = "${{ github.event.inputs.ENV }}"
+          region               = "${{ env.AWS_REGION }}"
+          image_tag_mutability = "MUTABLE"
+          scan_on_push         = true
+          encryption_type      = "AES256"
+          EOF
 
-      - name: Terraform Apply NLB
-        shell: bash
-        run: |
-          cd infra/nlb
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/nlb/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-
-      - name: Terraform Apply API Gateway
-        shell: bash
-        run: |
-          cd infra/rest-api
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/rest-api/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-
-      - name: Terraform Apply CloudWatch
-        shell: bash
-        run: |
-          cd infra/cloudwatch
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/cloudwatch/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-
-      - name: Terraform Apply ECR (ensure repo, output URL)
+      - name: Ensure/Output ECR repo
         id: ecr
         shell: bash
         run: |
@@ -208,77 +93,43 @@ jobs:
             -backend-config="key=${{ github.event.inputs.ENV }}/ecr/terraform.tfstate" \
             -backend-config="region=${TF_BACKEND_REGION}"
           terraform -chdir=infra/ecr apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-          ECR_REPO_URL=$(terraform -chdir=infra/ecr output -raw ecr_repository_url | tr -d '\r')
-          echo "ECR_REPO_URL=$ECR_REPO_URL" | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
+          ECR_REPO_URL="$(terraform -chdir=infra/ecr output -raw ecr_repository_url | tr -d '\r')"
+          echo "ECR_REPO_URL=$ECR_REPO_URL" >> "$GITHUB_ENV"
 
-      - name: Terraform Apply SSM (.env blob)
-        id: ssm
-        shell: bash
-        run: |
-          cd infra/ssm
-          PARAM_NAME="/idlms/shared/${{ github.event.inputs.ENV }}/.env"
-          if aws ssm get-parameter --name "$PARAM_NAME" --with-decryption > /dev/null 2>&1; then
-            ENV_CONTENT=$(aws ssm get-parameter --name "$PARAM_NAME" --with-decryption --query "Parameter.Value" --output text)
-            BASE64_ENV=$(echo "$ENV_CONTENT" | base64 -w 0)
-          else
-            BASE64_ENV=$(echo "# placeholder env" | base64 -w 0)
-          fi
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ssm/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars" -var="app_env_content=${BASE64_ENV}"
-          SSM_ENV_PARAM=$(terraform output -raw ssm_env_param_name | tr -d '\r\n' | sed 's/^ssm:\/\///')
-          echo "SSM_ENV_PARAM=$SSM_ENV_PARAM" >> $GITHUB_ENV
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Terraform Apply S3 (artifacts)
-        shell: bash
-        run: |
-          cd infra/s3
-          terraform init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/s3/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-
-      - name: Gather Terraform outputs (JSON)
-        id: gather
+      - name: Generate build tags
+        id: tags
         shell: bash
         run: |
           set -euo pipefail
-          ENV="${{ github.event.inputs.ENV }}"
-          jq -n \
-            --arg env "$ENV" \
-            --arg region "${AWS_REGION}" \
-            --arg ecr "$(terraform -chdir=infra/ecr        output -raw ecr_repository_url 2>/dev/null || echo '')" \
-            --argjson vpc "$(terraform -chdir=infra/vpc        output -json 2>/dev/null || echo '{}')" \
-            --argjson nlb "$(terraform -chdir=infra/nlb        output -json 2>/dev/null || echo '{}')" \
-            --argjson api "$(terraform -chdir=infra/rest-api   output -json 2>/dev/null || echo '{}')" \
-            --argjson cw  "$(terraform -chdir=infra/cloudwatch output -json 2>/dev/null || echo '{}')" \
-            --argjson s3  "$(terraform -chdir=infra/s3         output -json 2>/dev/null || echo '{}')" \
-            '{
-              env: $env,
-              region: $region,
-              ecr_repository_url: $ecr,
-              vpc: $vpc,
-              nlb: $nlb,
-              api_gateway: $api,
-              cloudwatch: $cw,
-              s3: $s3
-            }' | tee infra-outputs.json
+          ECR_REPO_URL="${{ env.ECR_REPO_URL }}"
+          DATE_TAG="$(date -u +'%Y.%m.%d')"
+          BUILD_NUM="$(printf "%03d" "$GITHUB_RUN_NUMBER")"
+          BUILD_TAG="${DATE_TAG}.${BUILD_NUM}"
+          IMAGE_URI="${ECR_REPO_URL}:${BUILD_TAG}"
+          LATEST_URI="${ECR_REPO_URL}:latest"
+          {
+            echo "BUILD_TAG=$BUILD_TAG"
+            echo "IMAGE_URI=$IMAGE_URI"
+            echo "LATEST_URI=$LATEST_URI"
+          } | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
 
-      - name: Upload infra outputs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: infra-outputs-${{ github.event.inputs.ENV }}
-          path: infra-outputs.json
-          if-no-files-found: error
+      - name: Build and tag Docker image
+        shell: bash
+        run: docker build -t "$IMAGE_URI" -t "$LATEST_URI" -f docker/Dockerfile src
 
-  # ───────────────────────────────────────── Deploy ─────────────────────────────────────────
+      - name: Push Docker images to ECR
+        shell: bash
+        run: |
+          docker push "$IMAGE_URI"
+          docker push "$LATEST_URI"
+
   deploy:
     runs-on: ubuntu-latest
-    needs: [build_image, provision_infra]
-    if: ${{ always() }}   # ensure deploy runs even if build_image was skipped
+    needs: [build_image]
+    if: ${{ always() }}
     environment: ${{ github.event.inputs.ENV }}
     steps:
       - name: Checkout
@@ -293,24 +144,61 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure ECR (deploy path) & export URL
-        id: ecr
+      - name: Map platform-main state bucket per ENV
+        id: map_platform_bucket
         shell: bash
         run: |
           set -euo pipefail
-          terraform -chdir=infra/ecr init \
-            -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${{ github.event.inputs.ENV }}/ecr/terraform.tfstate" \
-            -backend-config="region=${TF_BACKEND_REGION}"
-          terraform -chdir=infra/ecr apply -auto-approve -var-file="${{ github.event.inputs.ENV }}.tfvars"
-          ECR_REPO_URL=$(terraform -chdir=infra/ecr output -raw ecr_repository_url | tr -d '\r')
-          echo "ECR_REPO_URL=$ECR_REPO_URL" >> "$GITHUB_ENV"
+          case "${{ github.event.inputs.ENV }}" in
+            dev)
+              echo "PLATFORM_STATE_BUCKET=dev-btl-idlms-repo-backend-api-tfstate-592776312448" >> "$GITHUB_ENV"
+              ;;
+            stage)
+              echo "PLATFORM_STATE_BUCKET=stage-btl-idlms-repo-backend-api-tfstate-592776312448" >> "$GITHUB_ENV"
+              ;;
+            prod)
+              echo "PLATFORM_STATE_BUCKET=prod-btl-idlms-repo-backend-api-tfstate-592776312448" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::Unknown ENV"; exit 1 ;;
+          esac
 
-      - name: Upload docker-compose.yml to S3
+      - name: Detect platform-main state region
+        id: detect_platform_region
         shell: bash
         run: |
-          echo "Uploading docker-compose.yml to s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml"
-          aws s3 cp docker/docker-compose.yml "s3://${BACKUP_BUCKET}/${{ github.event.inputs.ENV }}/docker-compose.yml"
+          set -euo pipefail
+          B="$PLATFORM_STATE_BUCKET"
+          LOC="$(aws s3api get-bucket-location --bucket "$B" --query 'LocationConstraint' --output text || true)"
+          case "$LOC" in
+            None) LOC="us-east-1" ;;
+            EU)   LOC="eu-west-1" ;;
+          esac
+          if [ -z "$LOC" ] || [ "$LOC" = "null" ]; then
+            echo "::error::Could not detect region for bucket $B"
+            exit 1
+          fi
+          echo "PLATFORM_STATE_REGION=$LOC" >> "$GITHUB_ENV"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+        # terraform_wrapper default is true here; okay for read-only apply
+
+      - name: Read platform-main outputs
+        working-directory: infra/platform-remote
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform init -input=false -upgrade
+          terraform apply -input=false -auto-approve \
+            -var="env_name=${{ github.event.inputs.ENV }}" \
+            -var="region=${AWS_REGION}" \
+            -var="platform_state_bucket=${PLATFORM_STATE_BUCKET}" \
+            -var="platform_state_region=${PLATFORM_STATE_REGION}"
+          terraform output -json > /tmp/platform_outputs.json
+          echo "INSTANCE_ID=$(jq -r '.instance_id.value // empty' /tmp/platform_outputs.json)" >> "$GITHUB_ENV"
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -319,6 +207,7 @@ jobs:
         id: decide
         shell: bash
         run: |
+          set -euo pipefail
           if [ -n "${{ github.event.inputs.ROLLBACK_TAG }}" ]; then
             TAG="${{ github.event.inputs.ROLLBACK_TAG }}"
           elif [ -n "${{ needs.build_image.outputs.build_tag }}" ]; then
@@ -327,41 +216,40 @@ jobs:
             TAG="latest"
           fi
           echo "TAG_TO_DEPLOY=$TAG" | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
-          echo "Deploying tag: $TAG"
 
-      - name: Resolve EC2 instance
+      - name: Resolve EC2 instance (fallback)
         id: resolve_ec2
         shell: bash
         run: |
           set -euo pipefail
-          ENV="${{ github.event.inputs.ENV }}"
+          ENV_INPUT="${{ github.event.inputs.ENV }}"
           REGION="${{ env.AWS_REGION }}"
-          INSTANCE_ID="$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV}" "Name=instance-state-name,Values=running" \
-            --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
-            --region "$REGION" --output text || true)"
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+          if [ -z "${INSTANCE_ID:-}" ] || [ "${INSTANCE_ID}" = "null" ]; then
             INSTANCE_ID="$(aws ec2 describe-instances \
-              --filters "Name=tag:Name,Values=${ENV}-idlms-app" "Name=instance-state-name,Values=running" \
+              --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV_INPUT}" "Name=instance-state-name,Values=running" \
               --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
               --region "$REGION" --output text || true)"
           fi
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "::error::No running EC2 instance found for environment $ENV"
+            INSTANCE_ID="$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=${ENV_INPUT}-idlms-app" "Name=instance-state-name,Values=running" \
+              --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
+              --region "$REGION" --output text || true)"
+          fi
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::No running EC2 instance found for environment $ENV_INPUT"
             exit 1
           fi
           echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
-          echo "Resolved EC2: $INSTANCE_ID"
 
-      - name: Deploy containers with rollback logic via SSM
+      - name: Deploy containers via SSM
         shell: bash
         run: |
           set -euo pipefail
           TAG_TO_DEPLOY="${{ steps.decide.outputs.TAG_TO_DEPLOY }}"
-          ENV="${{ github.event.inputs.ENV }}"
+          ENV_INPUT="${{ github.event.inputs.ENV }}"
           ECR_REPO_URL="${{ env.ECR_REPO_URL }}"
           AWS_REGION="${{ env.AWS_REGION }}"
-          BACKUP_BUCKET="${{ env.BACKUP_BUCKET }}"
           INSTANCE_ID="${{ env.INSTANCE_ID }}"
 
           cat > ssm-deploy.json <<JSON
@@ -369,11 +257,10 @@ jobs:
             "commands": [
               "set -e",
               "cd /home/ubuntu",
-              "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV}/.env\" --with-decryption --query \"Parameter.Value\" --output text)",
+              "ENV_CONTENT=$(aws ssm get-parameter --name \"/idlms/shared/${ENV_INPUT}/.env\" --with-decryption --query \"Parameter.Value\" --output text)",
               "printf \"%s\" \"$ENV_CONTENT\" > .env",
               "echo \"BUILD_TAG=${TAG_TO_DEPLOY}\" >> .env",
               "echo \"IMAGE_REPO=${ECR_REPO_URL}\" >> .env",
-              "aws s3 cp s3://${BACKUP_BUCKET}/${ENV}/docker-compose.yml docker-compose.yml",
               "if ! command -v docker &> /dev/null; then sudo apt-get update -y && sudo apt-get install -y docker.io; fi",
               "if ! command -v docker-compose &> /dev/null; then curl -L \"https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)\" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose && ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose || true; fi",
               "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO_URL%/*}",
@@ -388,9 +275,83 @@ jobs:
           CMD_ID="$(aws ssm send-command \
             --document-name 'AWS-RunShellScript' \
             --instance-ids "$INSTANCE_ID" \
-            --comment "Deploy containers ${ENV} tag=${TAG_TO_DEPLOY}" \
+            --comment "Deploy containers ${ENV_INPUT} tag=${TAG_TO_DEPLOY}" \
             --parameters file://ssm-deploy.json \
             --query 'Command.CommandId' \
             --output text \
             --region "$AWS_REGION")"
           echo "SSM Command: $CMD_ID"
+
+  verify:
+    name: Post-deploy health check
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ always() && (needs.build_image.result == 'success' || needs.build_image.result == 'skipped') }}
+    environment: ${{ github.event.inputs.ENV }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait 45 seconds for containers to settle
+        shell: bash
+        run: sleep 45
+
+      - name: Health check via SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV_INPUT="${{ github.event.inputs.ENV }}"
+          AWS_REGION="${{ env.AWS_REGION }}"
+          INSTANCE_ID="$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=Backend API IDLMS-${ENV_INPUT}" "Name=instance-state-name,Values=running" \
+            --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
+            --region "$AWS_REGION" --output text || true)"
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            INSTANCE_ID="$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=${ENV_INPUT}-idlms-app" "Name=instance-state-name,Values=running" \
+              --query "sort_by(Reservations[].Instances[], &LaunchTime)[-1].InstanceId" \
+              --region "$AWS_REGION" --output text || true)"
+          fi
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::pods not up"
+            exit 1
+          fi
+
+          cat > ssm-check.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "if ! command -v docker >/dev/null 2>&1; then echo 'pods not up'; exit 1; fi",
+              "CNT=$(docker ps --format '{{.Names}} {{.Status}}' | awk '$2 ~ /^Up/ {c++} END{print c+0}')",
+              "if [ \"$CNT\" -ge 1 ]; then echo 'pods up'; else echo 'pods not up'; exit 1; fi"
+            ]
+          }
+          JSON
+
+          CMD_ID="$(aws ssm send-command \
+            --document-name 'AWS-RunShellScript' \
+            --instance-ids "$INSTANCE_ID" \
+            --comment 'Post-deploy health check' \
+            --parameters file://ssm-check.json \
+            --query 'Command.CommandId' \
+            --output text \
+            --region "$AWS_REGION")"
+
+          while true; do
+            STATUS="$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text --region "$AWS_REGION")"
+            case "$STATUS" in
+              Pending|InProgress|Delayed) sleep 5 ;;
+              Success|Cancelled|TimedOut|Failed) break ;;
+              *) sleep 5 ;;
+            esac
+          done
+          echo "SSM status: $STATUS"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text || true
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::pods not up"
+            exit 1
+          fi
