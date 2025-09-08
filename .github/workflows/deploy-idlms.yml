@@ -130,11 +130,27 @@ jobs:
             echo "Dockerfile not found (docker/Dockerfile or ./Dockerfile)"; exit 1
           fi
 
+      - name: Detect app source (package.json dir)
+        id: src
+        run: |
+          set -e
+          APP_SRC="$(
+            { git ls-files | grep -E '(^|/)package.json$' | grep -v '/node_modules/' | grep -v '^infra/'; } \
+            | { grep -E '/(idlms|idlms-api)/package.json$' || cat; } \
+            | head -n1 | xargs dirname
+          )"
+          if [ -z "$APP_SRC" ]; then
+            echo "package.json not found in repo"; exit 1
+          fi
+          echo "APP_SRC=$APP_SRC" | tee -a $GITHUB_OUTPUT
+          echo "Detected app dir: $APP_SRC"
+
       - name: Build image
         run: |
           DOCKER_BUILDKIT=1 docker build \
+            --build-arg APP_SRC="${{ steps.src.outputs.APP_SRC }}" \
             -t "${{ steps.refs.outputs.ECR_REPO_URL }}:${{ steps.tag.outputs.TAG }}" \
-            -f "${{ steps.df.outputs.DOCKERFILE }}" "${{ steps.df.outputs.CTX }}"
+            -f "${{ steps.df.outputs.DOCKERFILE }}" .
 
       - name: Push image
         run: docker push "${{ steps.refs.outputs.ECR_REPO_URL }}:${{ steps.tag.outputs.TAG }}"
