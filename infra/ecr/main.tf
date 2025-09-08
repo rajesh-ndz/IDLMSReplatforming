@@ -1,12 +1,18 @@
-module "ecr_license_api" {
-  source              = "../terraform-modules/ecr"
-  name                 = "license-api-${var.environment}"
-  image_tag_mutability = var.image_tag_mutability
-  scan_on_push         = var.scan_on_push
-  encryption_type      = var.encryption_type
+resource "aws_ecr_repository" "this" {
+  name = var.repository_name
+
+  image_scanning_configuration {
+    scan_on_push = var.image_scanning_on_push
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  force_delete = var.force_delete
 
   tags = {
-    Environment = var.environment
-    App         = "license-api"
+    Project     = "IDMS"
+    Environment = "stage"
   }
 }

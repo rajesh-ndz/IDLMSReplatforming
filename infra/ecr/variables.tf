@@ -1,20 +1,18 @@
-variable "environment" {
-  type    = string
-}
-
 variable "region" {
-  description = "AWS region to deploy resources into"
-  type        = string
+  type    = string
+  default = "ap-south-1"
 }
 
-variable "image_tag_mutability" {
-  type        = string
+variable "repository_name" {
+  type = string
 }
 
-variable "scan_on_push" {
-  type        = bool
+variable "image_scanning_on_push" {
+  type    = bool
+  default = true
 }
 
-variable "encryption_type" {
-  type        = string
+variable "force_delete" {
+  type    = bool
+  default = true
 }

@@ -71,7 +71,7 @@ jobs:
           cat > "infra/ecr/${{ github.event.inputs.ENV }}.tfvars" <<EOF
           environment          = "${{ github.event.inputs.ENV }}"
           region               = "${{ env.AWS_REGION }}"
-          image_tag_mutability = "IMMUTABLE"
+          image_tag_mutability = "MUTABLE"
           scan_on_push         = true
           encryption_type      = "AES256"
           EOF
