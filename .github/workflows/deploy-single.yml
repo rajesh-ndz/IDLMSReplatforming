@@ -15,7 +15,7 @@ on:
         required: false
         default: "main"
 
-env:
+env:  
   AWS_REGION: ${{ vars.AWS_REGION }}   # e.g. ap-south-1
   TF_BUCKET: stage-idlms-tfstate-592776312448
 
