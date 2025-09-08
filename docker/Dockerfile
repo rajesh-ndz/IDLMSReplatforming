@@ -1,45 +1,32 @@
-# ---- builder ----
+# Stage 1: Build the NestJS app
 FROM node:18-alpine AS builder
+
 WORKDIR /app
 
-# path to your app inside the repo (provided at build time)
-ARG APP_SRC=.
+# Copy only package files first for caching
+COPY package*.json ./
 
-# copy manifests first for cache
-COPY ${APP_SRC}/package*.json ./
-RUN if [ -f package-lock.json ]; then \
-    npm ci --no-audit --no-fund; \
-    else \
-    npm install --no-audit --no-fund; \
-    fi
+# Install all dependencies including @nestjs/cli
+RUN npm install
 
-# copy source and build
-COPY ${APP_SRC}/ ./
-RUN npm run build || echo "no build script; skipping"
+# Copy the rest of the source code
+COPY . .
 
-# ---- artifact (strip dev stuff like node_modules) ----
-FROM node:18-alpine AS artifact
-WORKDIR /out
-COPY --from=builder /app/ ./
-RUN rm -rf node_modules
+# Build the NestJS app (assumes main.ts and tsconfig etc. are here)
+RUN npm run build
 
-# ---- runtime ----
-FROM node:18-alpine AS runtime
+# Stage 2: Production image
+FROM node:18-alpine
+
 WORKDIR /app
 
-# install production deps only
-COPY --from=artifact /out/package*.json ./
-RUN if [ -f package-lock.json ]; then \
-    npm ci --omit=dev --no-audit --no-fund; \
-    else \
-    npm install --omit=dev --no-audit --no-fund; \
-    fi
+# Copy package files and install production deps
+COPY package*.json ./
+RUN npm install --only=production
 
-# bring app code (includes dist if it exists)
-COPY --from=artifact /out/ ./
+# Copy built app from builder
+COPY --from=builder /app/dist ./dist
 
-ENV NODE_ENV=production
 EXPOSE 4000
+CMD ["node", "dist/main.js"]
 
-# Prefer compiled dist/main.js (Nest). Fallback to npm start.
-CMD [ "sh", "-c", "if [ -f dist/main.js ]; then node dist/main.js; else npm start; fi" ]
