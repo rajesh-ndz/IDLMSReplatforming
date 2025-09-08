@@ -15,6 +15,10 @@ on:
         description: Deploy this tag instead of building (leave empty to build)
         required: false
         default: ""
+      APP_SRC:
+        description: "Path to folder containing package.json (optional, e.g. apps/idlms-api). Leave blank for auto-detect."
+        required: false
+        default: ""
 
 permissions:
   id-token: write
@@ -71,9 +75,7 @@ jobs:
         id: out
         run: |
           set -e
-          # Get relative path from Terraform while in the stack dir
           REF_REL="$(terraform -chdir='${{ env.REFS_STACK_DIR }}' output -raw file)"
-          # Resolve to absolute path from inside the stack dir
           REF_FILE="$(cd '${{ env.REFS_STACK_DIR }}' && python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$REF_REL")"
           echo "REF_FILE=$REF_FILE" | tee -a $GITHUB_OUTPUT
           echo "Refs file -> $REF_FILE"
@@ -134,13 +136,33 @@ jobs:
         id: src
         run: |
           set -e
-          APP_SRC="$(
-            { git ls-files | grep -E '(^|/)package.json$' | grep -v '/node_modules/' | grep -v '^infra/'; } \
-            | { grep -E '/(idlms|idlms-api)/package.json$' || cat; } \
-            | head -n1 | xargs dirname
-          )"
-          if [ -z "$APP_SRC" ]; then
-            echo "package.json not found in repo"; exit 1
+          # 1) If provided manually, use it
+          if [ -n "${{ github.event.inputs.APP_SRC }}" ]; then
+            APP_SRC="${{ github.event.inputs.APP_SRC }}"
+          else
+            # 2) Try git-tracked files first
+            CANDS="$(git ls-files | grep -E '(^|/)package.json$' | grep -v '/node_modules/' | grep -v '^infra/' || true)"
+            # Prefer ones containing idlms/idlms-api
+            PREF="$(echo "$CANDS" | grep -E '/(idlms|idlms-api)/package.json$' || true)"
+            if [ -n "$PREF" ]; then
+              CAND="$(echo "$PREF" | head -n1)"
+            else
+              CAND="$(echo "$CANDS" | head -n1)"
+            fi
+            # 3) Fallback to filesystem scan if nothing tracked
+            if [ -z "$CAND" ]; then
+              CAND="$(find . -type f -name package.json \
+                -not -path '*/node_modules/*' \
+                -not -path './infra/*' \
+                -not -path './.git/*' \
+                | sort | head -n1 || true)"
+            fi
+            if [ -z "$CAND" ]; then
+              echo "package.json not found. Candidates from git:"; git ls-files | grep -E '(^|/)package.json$' || true
+              echo "Candidates from find:"; find . -type f -name package.json | sed 's/^/ - /' || true
+              exit 1
+            fi
+            APP_SRC="$(dirname "$CAND")"
           fi
           echo "APP_SRC=$APP_SRC" | tee -a $GITHUB_OUTPUT
           echo "Detected app dir: $APP_SRC"
