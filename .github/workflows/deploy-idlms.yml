@@ -71,11 +71,14 @@ jobs:
         id: out
         run: |
           set -e
-          REF_FILE="$(terraform -chdir='${{ env.REFS_STACK_DIR }}' output -raw file)"
-          ABS="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$REF_FILE")"
-          echo "REF_FILE=$ABS" | tee -a $GITHUB_OUTPUT
-          echo "Refs file -> $ABS"
-          jq . "$ABS" || true
+          # Get relative path from Terraform while in the stack dir
+          REF_REL="$(terraform -chdir='${{ env.REFS_STACK_DIR }}' output -raw file)"
+          # Resolve to absolute path from inside the stack dir
+          REF_FILE="$(cd '${{ env.REFS_STACK_DIR }}' && python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$REF_REL")"
+          echo "REF_FILE=$REF_FILE" | tee -a $GITHUB_OUTPUT
+          echo "Refs file -> $REF_FILE"
+          jq . "$REF_FILE" || true
+
   build:
     name: Build & push image
     runs-on: ubuntu-latest
