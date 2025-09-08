@@ -56,7 +56,7 @@ resource "null_resource" "ensure_out_dir" {
 }
 
 resource "local_file" "outputs" {
-  filename   = local.out_path
-  content    = jsonencode(local.refs)
+  filename = abspath(local.out_path)
+  content  = jsonencode(local.refs)
   depends_on = [null_resource.ensure_out_dir]
 }

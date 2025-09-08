@@ -1,5 +1,5 @@
 output "file" {
-  value = "${path.module}/../../../../refs/${var.env}.outputs.json"
+  value = abspath(local.out_path)
 }
 
 output "ecr_repo_url" {
