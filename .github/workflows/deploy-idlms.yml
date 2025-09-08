@@ -1,0 +1,255 @@
+name: Deploy IDLMS (reuse platform-main)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ENV:
+        description: Environment
+        required: true
+        default: stage
+      GIT_REF:
+        description: Git ref to build from
+        required: true
+        default: main
+      ROLLBACK_TAG:
+        description: Deploy this tag instead of building (leave empty to build)
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  # refs-ssm stack lives under env path; we use ENV to pick it
+  REFS_STACK_DIR: infra/environments/${{ github.event.inputs.ENV }}/stacks/refs-ssm
+
+jobs:
+  refs:
+    name: Generate refs JSON (Terraform)
+    runs-on: ubuntu-latest
+    outputs:
+      REF_FILE: ${{ steps.out.outputs.REF_FILE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.GIT_REF }}
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init (no backend)
+        run: terraform -chdir="${{ env.REFS_STACK_DIR }}" init -backend=false
+
+      - name: Terraform apply - write refs file
+        run: |
+          set -e
+          STACK="${{ env.REFS_STACK_DIR }}"
+          # If a tfvars exists, use it; otherwise pass vars inline
+          if [ -f "$STACK/stage.tfvars" ]; then
+            terraform -chdir="$STACK" apply -auto-approve -var-file=stage.tfvars
+          else
+            terraform -chdir="$STACK" apply -auto-approve -var "env=${{ github.event.inputs.ENV }}" -var "region=${{ env.AWS_REGION }}"
+          fi
+
+      - name: Locate refs file
+        id: out
+        run: |
+          set -e
+          REF_FILE="$(terraform -chdir='${{ env.REFS_STACK_DIR }}' output -raw file)"
+          # make absolute path for safety
+          ABS="$(python3 - <<'PY'
+import os,sys
+p=sys.argv[1]
+print(os.path.abspath(p))
+PY
+"$REF_FILE")"
+          echo "REF_FILE=$ABS" | tee -a $GITHUB_OUTPUT
+          echo "Refs file -> $ABS"
+          echo "-----"
+          cat "$ABS"
+          echo
+          echo "----- jq pretty -----"
+          jq . "$ABS" || true
+
+  build:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    needs: [refs]
+    if: ${{ github.event.inputs.ROLLBACK_TAG == '' }} # skip build when rolling back
+    outputs:
+      TAG_TO_DEPLOY: ${{ steps.tag.outputs.TAG }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.GIT_REF }}
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Read refs (ECR repo URL)
+        id: refs
+        run: |
+          set -e
+          ECR=$(jq -r '.ecr_repo_url' '${{ needs.refs.outputs.REF_FILE }}')
+          echo "ECR_REPO_URL=$ECR" | tee -a $GITHUB_OUTPUT
+
+      - name: Compute tag
+        id: tag
+        run: echo "TAG=$(date -u +%Y.%m.%d.%H%M)" | tee -a $GITHUB_OUTPUT
+
+      - name: Login to ECR
+        run: |
+          REGISTRY="$(echo "${{ steps.refs.outputs.ECR_REPO_URL }}" | cut -d/ -f1)"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+
+      - name: Detect Dockerfile
+        id: df
+        run: |
+          if [ -f docker/Dockerfile ]; then
+            echo "DOCKERFILE=docker/Dockerfile" | tee -a $GITHUB_OUTPUT
+            echo "CTX=." | tee -a $GITHUB_OUTPUT
+          elif [ -f Dockerfile ]; then
+            echo "DOCKERFILE=Dockerfile" | tee -a $GITHUB_OUTPUT
+            echo "CTX=." | tee -a $GITHUB_OUTPUT
+          else
+            echo "Dockerfile not found (docker/Dockerfile or ./Dockerfile)"; exit 1
+          fi
+
+      - name: Build image
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            -t "${{ steps.refs.outputs.ECR_REPO_URL }}:${{ steps.tag.outputs.TAG }}" \
+            -f "${{ steps.df.outputs.DOCKERFILE }}" "${{ steps.df.outputs.CTX }}"
+
+      - name: Push image
+        run: docker push "${{ steps.refs.outputs.ECR_REPO_URL }}:${{ steps.tag.outputs.TAG }}"
+
+  deploy:
+    name: SSM deploy
+    runs-on: ubuntu-latest
+    needs: [refs, build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.GIT_REF }}
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Load refs + decide tag
+        id: decide
+        run: |
+          set -e
+          FILE='${{ needs.refs.outputs.REF_FILE }}'
+          ECR=$(jq -r '.ecr_repo_url' "$FILE")
+          IID=$(jq -r '.instance_id' "$FILE")
+          APIGW=$(jq -r '.apigw_invoke_url // empty' "$FILE")
+          echo "ECR_REPO_URL=$ECR" | tee -a $GITHUB_OUTPUT
+          echo "INSTANCE_ID=$IID"  | tee -a $GITHUB_OUTPUT
+          echo "APIGW_URL=$APIGW" | tee -a $GITHUB_OUTPUT
+
+          TAG="${{ needs.build.outputs.TAG_TO_DEPLOY }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.inputs.ROLLBACK_TAG }}"
+          fi
+          if [ -z "$TAG" ]; then echo "No tag to deploy"; exit 1; fi
+          echo "TAG=$TAG" | tee -a $GITHUB_OUTPUT
+
+      - name: Prepare SSM command
+        run: |
+          cat > /tmp/deploy_inner.sh <<'SH'
+          set -euo pipefail
+          export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+          APP_DIR="/opt/idlms"
+          ECR="${ECR}"
+          TAG="${TAG}"
+          ENV_PARAM="/idlms/shared/${ENV}/.env"
+
+          if docker compose version >/dev/null 2>&1; then
+            COMPOSE="docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            COMPOSE="docker-compose"
+          else
+            echo "docker compose or docker-compose not found on instance"; exit 1
+          fi
+
+          sudo mkdir -p "$APP_DIR"
+          cd "$APP_DIR"
+
+          if [ ! -f docker-compose.yml ]; then
+            cat > docker-compose.yml <<'YML'
+          version: "3.8"
+          services:
+            api:
+              image: ${ECR}:${TAG}
+              container_name: idlms-api
+              restart: always
+              ports:
+                - "4000:4000"
+              env_file:
+                - .env
+          YML
+          fi
+
+          aws ssm get-parameter --with-decryption --name "$ENV_PARAM" --query 'Parameter.Value' --output text > .env
+
+          REGISTRY="$(echo "$ECR" | cut -d/ -f1)"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+          docker pull "${ECR}:${TAG}"
+
+          $COMPOSE pull
+          $COMPOSE up -d --force-recreate
+          docker image prune -f >/dev/null 2>&1 || true
+
+          echo "OK"
+          SH
+
+          sed -i "s#\\${AWS_REGION}#${{ env.AWS_REGION }}#g" /tmp/deploy_inner.sh
+          sed -i "s#\\${ECR}#${{ steps.decide.outputs.ECR_REPO_URL }}#g" /tmp/deploy_inner.sh
+          sed -i "s#\\${TAG}#${{ steps.decide.outputs.TAG }}#g" /tmp/deploy_inner.sh
+          sed -i "s#\\${ENV}#${{ github.event.inputs.ENV }}#g" /tmp/deploy_inner.sh
+
+          echo "{ \"commands\": [ $(jq -Rs . /tmp/deploy_inner.sh) ] }" > /tmp/params.json
+
+      - name: Send SSM command
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ steps.decide.outputs.INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/params.json \
+            --cloud-watch-output-config CloudWatchLogGroupName="/aws/ssm/idlms-deploy",CloudWatchOutputEnabled=true \
+            --query 'Command.CommandId' --output text
+
+      - name: Smoke test (optional)
+        if: ${{ steps.decide.outputs.APIGW_URL != '' }}
+        run: |
+          URL="${{ steps.decide.outputs.APIGW_URL }}"
+          echo "Checking: $URL"
+          for i in {1..20}; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "$URL")" || true
+            echo "Attempt $i -> $code"
+            if [ "$code" = "200" ] || [ "$code" = "403" ] || [ "$code" = "404" ]; then
+              echo "Gateway responding."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Gateway not responding as expected"; exit 1
