@@ -17,7 +17,7 @@ on:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}   # e.g. ap-south-1
-  TF_BUCKET: test-s3-idlmreplatforming-tfstate
+  TF_BUCKET: stage-idlms-tfstate-592776312448
 
 permissions:
   id-token: write
