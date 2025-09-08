@@ -213,14 +213,14 @@ jobs:
 
       - name: Prepare SSM command
         run: |
-          cat > /tmp/deploy_inner.sh <<'SH'
+          cat > /tmp/deploy_inner.sh <<EOF
           set -euo pipefail
-          export AWS_DEFAULT_REGION="${AWS_REGION}"
+          export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
 
           APP_DIR="/opt/idlms"
-          ECR="${ECR}"
-          TAG="${TAG}"
-          ENV_PARAM="/idlms/shared/${ENV}/.env"
+          ECR="${{ steps.decide.outputs.ECR_REPO_URL }}"
+          TAG="${{ steps.decide.outputs.TAG }}"
+          ENV_PARAM="/idlms/shared/${{ github.event.inputs.ENV }}/.env"
 
           if docker compose version >/dev/null 2>&1; then
             COMPOSE="docker compose"
@@ -248,25 +248,27 @@ jobs:
           YML
           fi
 
+          # refresh .env from SSM
           aws ssm get-parameter --with-decryption --name "$ENV_PARAM" --query 'Parameter.Value' --output text > .env
 
+          # ECR login & pull
           REGISTRY="$(echo "$ECR" | cut -d/ -f1)"
           aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
           docker pull "${ECR}:${TAG}"
 
+          # restart
           $COMPOSE pull
           $COMPOSE up -d --force-recreate
           docker image prune -f >/dev/null 2>&1 || true
 
           echo "OK"
-          SH
+          EOF
 
-          sed -i "s#\\${AWS_REGION}#${{ env.AWS_REGION }}#g" /tmp/deploy_inner.sh
-          sed -i "s#\\${ECR}#${{ steps.decide.outputs.ECR_REPO_URL }}#g" /tmp/deploy_inner.sh
-          sed -i "s#\\${TAG}#${{ steps.decide.outputs.TAG }}#g" /tmp/deploy_inner.sh
-          sed -i "s#\\${ENV}#${{ github.event.inputs.ENV }}#g" /tmp/deploy_inner.sh
-
+          # Wrap for SSM
           echo "{ \"commands\": [ $(jq -Rs . /tmp/deploy_inner.sh) ] }" > /tmp/params.json
+          echo "Prepared /tmp/deploy_inner.sh:"
+          head -n 30 /tmp/deploy_inner.sh
+
 
       - name: Send SSM command
         run: |
